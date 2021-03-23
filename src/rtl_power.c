@@ -64,7 +64,6 @@
 #define HAVE_STRUCT_TIMESPEC
 #endif
 #include <pthread.h>
-#include <libusb.h>
 
 #include <rtl-sdr.h>
 #include <rtl_app_ver.h>
