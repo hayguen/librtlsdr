@@ -174,6 +174,11 @@ add_custom_target(udev_rules
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/rtl-sdr.rules /etc/udev/rules.d/rtl-sdr.rules
 )
 
+add_custom_target(blacklist
+    COMMENT "install module blacklist into /etc/modprobe.d/"
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/rtlsdr-blacklist.conf /etc/modprobe.d/blacklist_rtlsdr.conf
+)
+
 option(DETACH_KERNEL_DRIVER "Detach kernel driver if loaded" OFF)
 if (DETACH_KERNEL_DRIVER)
     message (STATUS "Building with kernel driver detaching enabled")
