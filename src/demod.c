@@ -54,17 +54,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#ifndef _WIN32
-#include <unistd.h>
-#else
-#include <windows.h>
-#include <fcntl.h>
-#include <io.h>
-#include "getopt/getopt.h"
-#define usleep(x) Sleep(x/1000)
-#if defined(_MSC_VER) && (_MSC_VER < 1900)
-#define snprintf _snprintf
-#endif
+#ifdef _WIN32
 #if defined(_MSC_VER) && (_MSC_VER < 1800)
 #define round(x) (x > 0.0 ? floor(x + 0.5): ceil(x - 0.5))
 #endif
@@ -75,18 +65,14 @@
 
 #define DEFAULT_SAMPLE_RATE		24000
 
-static int *atan_lut = NULL;
+static int *atan_lut = NULL;    /* @todo: -> 16 bit to reduce CPU cache consumption */
 static int atan_lut_size = 131072; /* 512 KB */
 static int atan_lut_coef = 8;
 
 
-/* more cond dumbness */
-#define safe_cond_signal(n, m) do { pthread_mutex_lock(m); pthread_cond_signal(n); pthread_mutex_unlock(m); } while (0)
-#define safe_cond_wait(n, m)   do { pthread_mutex_lock(m); pthread_cond_wait(n, m); pthread_mutex_unlock(m); } while (0)
-
 /* {length, coef, coef, coef}  and scaled by 2^15
    for now, only length 9, optimal way to get +85% bandwidth */
-int cic_9_tables[][10] = {
+static const int cic_9_tables[][10] = {
 	{0,},
 	{9, -156,  -97, 2798, -15489, 61019, -15489, 2798,  -97, -156},
 	{9, -128, -568, 5593, -24125, 74126, -24125, 5593, -568, -128},
@@ -99,13 +85,6 @@ int cic_9_tables[][10] = {
 	{9, -119, -577, 5917, -26067, 77473, -26067, 5917, -577, -119},
 	{9, -199, -362, 5303, -25505, 77489, -25505, 5303, -362, -199},
 };
-
-#if defined(_MSC_VER) && (_MSC_VER < 1800)
-double log2(double n)
-{
-	return log(n) / log(2.0);
-}
-#endif
 
 
 /* uint8_t negation = 255 - x */
@@ -192,26 +171,43 @@ void rotate_neg90(unsigned char *buf, uint32_t len)
 	}
 }
 
+/* simple square window FIR for quadrature signal
+ * with decimation by d->downsample
+ * input is d->lowpassed[] with size d->lp_len
+ * output is put inplace to d->lowpassed[]; d->lp_len is updated
+ * lowpass does not compensate the sum
+ * produces additional ceil(log2(downsample)) bits
+ * e.g. additional 5 bits for decimation from 3200 to 100 kHz
+ * or   additional 4 bits for decimation from 2400 to 171 kHz
+ */
 void low_pass(struct demod_state *d)
 /* simple square window FIR */
 {
 	int i=0, i2=0;
+	const int downsample = d->downsample;
+	int lp_index = d->lp_index;
+	int lp_sum_r = d->lp_sum_r;
+	int lp_sum_j = d->lp_sum_j;
+
 	while (i < d->lp_len) {
-		d->now_r += d->lowpassed[i];
-		d->now_j += d->lowpassed[i+1];
+		lp_sum_r += d->lowpassed[i];
+		lp_sum_j += d->lowpassed[i+1];
 		i += 2;
-		d->prev_index++;
-		if (d->prev_index < d->downsample) {
+		lp_index++;
+		if (lp_index < downsample) {
 			continue;
 		}
-		d->lowpassed[i2]   = d->now_r; /* * d->output_scale; */
-		d->lowpassed[i2+1] = d->now_j; /* * d->output_scale; */
-		d->prev_index = 0;
-		d->now_r = 0;
-		d->now_j = 0;
+		d->lowpassed[i2]   = lp_sum_r; /* * d->output_scale; */
+		d->lowpassed[i2+1] = lp_sum_j; /* * d->output_scale; */
+		lp_index = 0;
+		lp_sum_r = 0;
+		lp_sum_j = 0;
 		i2 += 2;
 	}
 	d->lp_len = i2;
+	d->lp_index = lp_index;
+	d->lp_sum_r = lp_sum_r;
+	d->lp_sum_j = lp_sum_j;
 }
 
 int low_pass_simple(int16_t *signal2, int len, int step)
@@ -235,23 +231,33 @@ void low_pass_real(struct demod_state *s)
 /* add support for upsampling? */
 {
 	int i=0, i2=0;
-	int fast = (int)s->rate_out;
-	int slow = s->rate_out2;
+	int lpr_index = s->lpr_index;
+	int lpr_sum = s->lpr_sum;
+    const int fast = s->rate_out;
+	const int slow = s->rate_out2;
 	while (i < s->result_len) {
-		s->now_lpr += s->result[i];
+		lpr_sum += s->result[i];
 		i++;
-		s->prev_lpr_index += slow;
-		if (s->prev_lpr_index < fast) {
+		lpr_index += slow;
+		if (lpr_index < fast) {
 			continue;
 		}
-		s->result[i2] = (int16_t)(s->now_lpr / (fast/slow));
-		s->prev_lpr_index -= fast;
-		s->now_lpr = 0;
+		s->result[i2] = (int16_t)(lpr_sum / (fast/slow));
+		lpr_index -= fast;
+		lpr_sum = 0;
 		i2 += 1;
 	}
 	s->result_len = i2;
+	s->lpr_index = lpr_index;
+	s->lpr_sum = lpr_sum;
 }
 
+/* (looks like) a 6-tap decimation-by-2 filter
+ * for interleaved quadrature I/Q data
+ * processes every 2nd sample of data[],
+ * thus needs to be called twice
+ * produces 1 additional bit per call (stage)
+ */
 void fifth_order(int16_t *data, int length, int16_t *hist)
 /* for half of interleaved data */
 {
@@ -263,7 +269,12 @@ void fifth_order(int16_t *data, int length, int16_t *hist)
 	d = hist[4];
 	e = hist[5];
 	f = data[0];
-	/* a downsample should improve resolution, so don't fully shift */
+	/* downsampling improves resolution, so don't fully shift:
+	 * considering multiplication with 5 and 10,
+	 * one input is multiplied up to 32 (= 1+5+10+10+5+1)
+	 * that would need up to additional 5 bits.
+	 * => use one additional bit per decimation step
+	 */
 	data[0] = (a + (b+e)*5 + (c+d)*10 + f) >> 4;
 	for (i=4; i<length; i+=4) {
 		a = c;
@@ -283,7 +294,15 @@ void fifth_order(int16_t *data, int length, int16_t *hist)
 	hist[5] = f;
 }
 
-void generic_fir(int16_t *data, int length, int *fir, int16_t *hist)
+/* 9-tap FIR for interleaved quadrature I/Q data,
+ * processes every 2nd sample of data[],
+ * thus needs to be called twice.
+ * FIR state (=history) is saved/read from hist[]
+ * FIR coefficients are expexted in fir[1..9] - symmetric around fir[5]
+ *   => only fir[1..5] are used
+ * produces additional 3 bits
+ */
+void generic_fir(int16_t *data, int length, const int *fir, int16_t *hist)
 /* Okay, not at all generic.  Assumes length 9, fix that eventually. */
 {
 	int d, temp, sum;
@@ -294,8 +313,13 @@ void generic_fir(int16_t *data, int length, int *fir, int16_t *hist)
 		sum += (hist[1] + hist[7]) * fir[2];
 		sum += (hist[2] + hist[6]) * fir[3];
 		sum += (hist[3] + hist[5]) * fir[4];
-		sum +=			hist[4]  * fir[5];
-		data[d] = sum >> 15 ;
+		sum +=		hist[4]  * fir[5];
+		/* convolution (multiplications & sum) requires additional bits.
+		 * one input is multiplied up to 144156 (=sum(abs(cic_9_tables[])))
+		 * that would need up to additional 18 bits (=ceil(log2(144156)))
+		 * shift right by 15 => use up to 3 additional bits
+		 */
+		data[d] = sum >> 15;
 		hist[0] = hist[1];
 		hist[1] = hist[2];
 		hist[2] = hist[3];
@@ -317,7 +341,7 @@ static void multiply(int ar, int aj, int br, int bj, int *cr, int *cj)
 	*cj = aj*br + ar*bj;
 }
 
-int polar_discriminant(int ar, int aj, int br, int bj)
+static int polar_discriminant(int ar, int aj, int br, int bj)
 {
 	int cr, cj;
 	double angle;
@@ -326,7 +350,7 @@ int polar_discriminant(int ar, int aj, int br, int bj)
 	return (int)(angle / 3.14159 * (1<<14));
 }
 
-int fast_atan2(int y, int x)
+static int fast_atan2(int y, int x)
 /* pre scaled for int16 */
 {
 	int yabs, angle;
@@ -349,7 +373,7 @@ int fast_atan2(int y, int x)
 	return angle;
 }
 
-int polar_disc_fast(int ar, int aj, int br, int bj)
+static int polar_disc_fast(int ar, int aj, int br, int bj)
 {
 	int cr, cj;
 	multiply(ar, aj, br, -bj, &cr, &cj);
@@ -358,18 +382,16 @@ int polar_disc_fast(int ar, int aj, int br, int bj)
 
 int atan_lut_init(void)
 {
-	int i = 0;
-
 	atan_lut = malloc(atan_lut_size * sizeof(int));
 
-	for (i = 0; i < atan_lut_size; i++) {
+	for (int i = 0; i < atan_lut_size; i++) {
 		atan_lut[i] = (int) (atan((double) i / (1<<atan_lut_coef)) / 3.14159 * (1<<14));
 	}
 
 	return 0;
 }
 
-int polar_disc_lut(int ar, int aj, int br, int bj)
+static int polar_disc_lut(int ar, int aj, int br, int bj)
 {
 	int cr, cj, x, x_abs;
 
@@ -407,7 +429,7 @@ int polar_disc_lut(int ar, int aj, int br, int bj)
 	return 0;
 }
 
-int esbensen(int ar, int aj, int br, int bj)
+static int esbensen(int ar, int aj, int br, int bj)
 /*
   input signal: s(t) = a*exp(-i*w*t+p)
   a = amplitude, w = angular freq, p = phase difference
@@ -427,12 +449,11 @@ int esbensen(int ar, int aj, int br, int bj)
 
 void fm_demod(struct demod_state *fm)
 {
-	int i, pcm;
-	int16_t *lp = fm->lowpassed;
-	pcm = polar_discriminant(lp[0], lp[1],
+	const int16_t *lp = fm->lowpassed;
+	int pcm = polar_discriminant(lp[0], lp[1],
 		fm->pre_r, fm->pre_j);
 	fm->result[0] = (int16_t)pcm;
-	for (i = 2; i < (fm->lp_len-1); i += 2) {
+	for (int i = 2; i < (fm->lp_len-1); i += 2) {
 		switch (fm->custom_atan) {
 		case 0:
 			pcm = polar_discriminant(lp[i], lp[i+1],
@@ -461,16 +482,17 @@ void fm_demod(struct demod_state *fm)
 void am_demod(struct demod_state *fm)
 /* todo, fix this extreme laziness */
 {
-	int i, pcm;
 	int16_t *lp = fm->lowpassed;
 	int16_t *r  = fm->result;
-	for (i = 0; i < fm->lp_len; i += 2) {
+	const int output_scale = fm->output_scale;
+	int pcm;
+	for (int i = 0; i < fm->lp_len; i += 2) {
 		/* hypot uses floats but won't overflow
 		* r[i/2] = (int16_t)hypot(lp[i], lp[i+1]);
 		*/
-		pcm = lp[i] * lp[i];
-		pcm += lp[i+1] * lp[i+1];
-		r[i/2] = (int16_t)sqrt(pcm) * fm->output_scale;
+		pcm = (int)lp[i] * lp[i];
+		pcm += (int)lp[i+1] * lp[i+1];
+		r[i/2] = (int16_t)(sqrt(pcm) * output_scale);
 	}
 	fm->result_len = fm->lp_len/2;
 	/* lowpass? (3khz)  highpass?  (dc) */
@@ -478,40 +500,43 @@ void am_demod(struct demod_state *fm)
 
 void usb_demod(struct demod_state *fm)
 {
-	int i, pcm;
-	int16_t *lp = fm->lowpassed;
+	const int16_t *lp = fm->lowpassed;
 	int16_t *r  = fm->result;
-	for (i = 0; i < fm->lp_len; i += 2) {
-		pcm = lp[i] + lp[i+1];
-		r[i/2] = (int16_t)pcm * fm->output_scale;
+	const int output_scale = fm->output_scale;
+	int pcm;
+	for (int i = 0; i < fm->lp_len; i += 2) {
+		pcm = (int)lp[i] + lp[i+1];
+		r[i/2] = (int16_t)(pcm * output_scale);
 	}
 	fm->result_len = fm->lp_len/2;
 }
 
 void lsb_demod(struct demod_state *fm)
 {
-	int i, pcm;
-	int16_t *lp = fm->lowpassed;
+	const int16_t *lp = fm->lowpassed;
 	int16_t *r  = fm->result;
-	for (i = 0; i < fm->lp_len; i += 2) {
-		pcm = lp[i] - lp[i+1];
-		r[i/2] = (int16_t)pcm * fm->output_scale;
+	const int output_scale = fm->output_scale;
+	int pcm;
+	for (int i = 0; i < fm->lp_len; i += 2) {
+		pcm = (int)lp[i] - lp[i+1];
+		r[i/2] = (int16_t)(pcm * output_scale);
 	}
 	fm->result_len = fm->lp_len/2;
 }
 
 void raw_demod(struct demod_state *fm)
 {
-	int i;
-	for (i = 0; i < fm->lp_len; i++) {
-		fm->result[i] = (int16_t)fm->lowpassed[i];
+	for (int i = 0; i < fm->lp_len; i++) {
+		fm->result[i] = fm->lowpassed[i];
 	}
 	fm->result_len = fm->lp_len;
 }
 
 void deemph_filter(struct demod_state *fm)
 {
-	static int avg;  /* cheating... */
+	const int alpha = fm->deemph_a;
+	const int alpha_2 = alpha /2;
+	int avg = fm->deemph_avg;
 	int i, d;
 	/* de-emph IIR
 	 * avg = avg * (1 - alpha) + sample * alpha;
@@ -519,30 +544,31 @@ void deemph_filter(struct demod_state *fm)
 	for (i = 0; i < fm->result_len; i++) {
 		d = fm->result[i] - avg;
 		if (d > 0) {
-			avg += (d + fm->deemph_a/2) / fm->deemph_a;
+			avg += (d + alpha_2) / alpha;
 		} else {
-			avg += (d - fm->deemph_a/2) / fm->deemph_a;
+			avg += (d - alpha_2) / alpha;
 		}
 		fm->result[i] = (int16_t)avg;
 	}
+	fm->deemph_avg = avg;
 }
 
-void dc_block_audio_filter(struct demod_state *fm)
+void dc_block_audio_filter(int16_t *buf, int len, int *adc_avg_state, int adc_block_const)
 {
 	int i, avg;
 	int64_t sum = 0;
-	for (i=0; i < fm->result_len; i++) {
-		sum += fm->result[i];
+	for (i=0; i < len; i++) {
+		sum += buf[i];
 	}
-	avg = sum / fm->result_len;
-	avg = (avg + fm->dc_avg * fm->adc_block_const) / ( fm->adc_block_const + 1 );
-	for (i=0; i < fm->result_len; i++) {
-		fm->result[i] -= avg;
+	avg = sum / len;
+	avg = (avg + (*adc_avg_state) * adc_block_const) / ( adc_block_const + 1 );
+	for (i=0; i < len; i++) {
+		buf[i] -= avg;
 	}
-	fm->dc_avg = avg;
+	*adc_avg_state = avg;
 }
 
-void dc_block_raw_filter(struct demod_state *fm, int16_t *buf, int len)
+void dc_block_raw_filter(int16_t *buf, int len, int rdc_avg_state[2], int rdc_block_const)
 {
 	/* derived from dc_block_audio_filter,
 		running over the raw I/Q components
@@ -556,17 +582,17 @@ void dc_block_raw_filter(struct demod_state *fm, int16_t *buf, int len)
 	}
 	avgI = sumI / ( len / 2 );
 	avgQ = sumQ / ( len / 2 );
-	avgI = (avgI + fm->dc_avgI * fm->rdc_block_const) / ( fm->rdc_block_const + 1 );
-	avgQ = (avgQ + fm->dc_avgQ * fm->rdc_block_const) / ( fm->rdc_block_const + 1 );
+	avgI = (avgI + rdc_avg_state[0] * rdc_block_const) / ( rdc_block_const + 1 );
+	avgQ = (avgQ + rdc_avg_state[1] * rdc_block_const) / ( rdc_block_const + 1 );
 	for (i = 0; i < len; i += 2) {
 		buf[i] -= avgI;
 		buf[i+1] -= avgQ;
 	}
-	fm->dc_avgI = avgI;
-	fm->dc_avgQ = avgQ;
+	rdc_avg_state[0] = avgI;
+	rdc_avg_state[1] = avgQ;
 }
 
-static int mad(int16_t *samples, int len, int step)
+static int mad(const int16_t *samples, int len, int step)
 /* mean average deviation */
 {
 	int i=0, sum=0, ave=0;
@@ -583,7 +609,7 @@ static int mad(int16_t *samples, int len, int step)
 	return sum / (len / step);
 }
 
-int rms(int16_t *samples, int len, int step, int omitDCfix)
+int rms(const int16_t *samples, int len, int step, int omitDCfix)
 /* largely lifted from rtl_power */
 {
 	double dc, err;
@@ -614,7 +640,7 @@ int rms(int16_t *samples, int len, int step, int omitDCfix)
 	return (int)sqrt((p-err) / len);
 }
 
-static void arbitrary_upsample(int16_t *buf1, int16_t *buf2, int len1, int len2)
+static void arbitrary_upsample(const int16_t *buf1, int16_t *buf2, int len1, int len2)
 /* linear interpolation, len1 < len2 */
 {
 	int i = 1;
@@ -637,7 +663,7 @@ static void arbitrary_upsample(int16_t *buf1, int16_t *buf2, int len1, int len2)
 	}
 }
 
-static void arbitrary_downsample(int16_t *buf1, int16_t *buf2, int len1, int len2)
+static void arbitrary_downsample(const int16_t *buf1, int16_t *buf2, int len1, int len2)
 /* fractional boxcar lowpass, len1 > len2 */
 {
 	int i = 1;
@@ -668,7 +694,7 @@ static void arbitrary_downsample(int16_t *buf1, int16_t *buf2, int len1, int len
 		buf2[j] = buf2[j] * len2 / len1;}
 }
 
-static void arbitrary_resample(int16_t *buf1, int16_t *buf2, int len1, int len2)
+static void arbitrary_resample(const int16_t *buf1, int16_t *buf2, int len1, int len2)
 /* up to you to calculate lengths and make sure it does not go OOB
  * okay for buffers to overlap, if you are downsampling */
 {
@@ -679,19 +705,25 @@ static void arbitrary_resample(int16_t *buf1, int16_t *buf2, int len1, int len2)
 	}
 }
 
-static void full_demod_light(struct demod_state *d)
+
+void downsample_input(struct demod_state *d)
 {
-	/* copied from rtl_fm.c full_demod(), removed squelch, level printing, .. */
-	int i, ds_p;
-	ds_p = d->downsample_passes;
+	const int ds_p = d->downsample_passes;
 	if (ds_p) {
-		for (i=0; i < ds_p; i++) {
+		/* this branch might overflow 16 bits!:
+		 *   8 bits from input
+		 * + 3 bits from generic_fir()
+		 * + 1 bit per per stage
+		 * = 11 + number of stages
+		 * => overflow with more than 5 stages!
+		 */
+		for (int i=0; i < ds_p; i++) {
 			fifth_order(d->lowpassed,   (d->lp_len >> i), d->lp_i_hist[i]);
 			fifth_order(d->lowpassed+1, (d->lp_len >> i) - 1, d->lp_q_hist[i]);
 		}
 		d->lp_len = d->lp_len >> ds_p;
 		/* droop compensation */
-		if (d->comp_fir_size == 9 && ds_p <= CIC_TABLE_MAX) {
+		if (d->comp_fir_size == 9 && ds_p <= MAXIMUM_DOWNSAMPLE_PASSES) {
 			generic_fir(d->lowpassed, d->lp_len,
 				cic_9_tables[ds_p], d->droop_i_hist);
 			generic_fir(d->lowpassed+1, d->lp_len-1,
@@ -700,6 +732,14 @@ static void full_demod_light(struct demod_state *d)
 	} else {
 		low_pass(d);
 	}
+}
+
+static void full_demod_light(struct demod_state *d)
+/* copied from rtl_fm.c full_demod(), removed squelch, level printing, ..
+ * demonstrates full usage
+ */
+{
+	downsample_input(d);
 
 	d->mode_demod(d);  /* lowpassed -> result */
 	if (d->mode_demod == &raw_demod) {
@@ -712,52 +752,50 @@ static void full_demod_light(struct demod_state *d)
 	if (d->deemph) {
 		deemph_filter(d);}
 	if (d->dc_block_audio) {
-		dc_block_audio_filter(d);}
+		dc_block_audio_filter(d->result, d->result_len, &(d->adc_avg), d->adc_block_const);}
 	if (d->rate_out2 > 0) {
 		low_pass_real(d);
 		/* arbitrary_resample(d->result, d->result, d->result_len, d->result_len * d->rate_out2 / d->rate_out); */
 	}
 }
 
-void demod_init(struct demod_state *s, struct output_state *output, struct cmd_state *cmd)
+void demod_init(struct demod_state *s)
 {
+	s->comp_fir_size = 0;
+
 	s->rate_in = DEFAULT_SAMPLE_RATE;
 	s->rate_out = DEFAULT_SAMPLE_RATE;
+	s->rate_out2 = -1;	// flag for disabled
+
+	s->downsample = 1;
+	s->downsample_passes = 0;
+	s->post_downsample = 1;	// once this works, default = 4
+
 	s->squelch_level = 0;
 	s->conseq_squelch = 10;
 	s->terminate_on_squelch = 0;
 	s->squelch_hits = 11;
-	s->downsample_passes = 0;
-	s->comp_fir_size = 0;
-	s->prev_index = 0;
-	s->post_downsample = 1;	// once this works, default = 4
-	s->custom_atan = 0;
-	s->deemph = 0;
-	s->rate_out2 = -1;	// flag for disabled
-	s->mode_demod = &fm_demod;
-	s->pre_j = s->pre_r = s->now_r = s->now_j = 0;
-	s->prev_lpr_index = 0;
-	s->deemph_a = 0;
-	s->now_lpr = 0;
-	s->dc_block_audio = 0;
-	s->dc_avg = 0;
-	s->adc_block_const = 9;
-	s->dc_block_raw = 0;
-	s->dc_avgI = 0;
-	s->dc_avgQ = 0;
-	s->rdc_block_const = 9;
-	pthread_rwlock_init(&s->rw, NULL);
-	pthread_cond_init(&s->ready, NULL);
-	pthread_mutex_init(&s->ready_m, NULL);
-    s->output_target = output;
-    s->cmd = cmd;
-}
 
-void demod_cleanup(struct demod_state *s)
-{
-	pthread_rwlock_destroy(&s->rw);
-	pthread_cond_destroy(&s->ready);
-	pthread_mutex_destroy(&s->ready_m);
+	s->custom_atan = 0;
+	s->pre_j = s->pre_r = 0;
+
+	s->mode_demod = &fm_demod;
+
+	s->lp_index = 0;
+	s->lp_sum_r = s->lp_sum_j = 0;
+
+	s->lpr_index = 0;
+	s->lpr_sum = 0;
+
+	s->deemph = 0;
+	s->deemph_a = 0;
+	s->deemph_avg = 0;
+
+	s->dc_block_audio = 0;
+	s->adc_avg = 0;
+	s->adc_block_const = 9;
+
+	s->omit_dc_fix = 0;
 }
 
 /* vim: tabstop=8:softtabstop=8:shiftwidth=8:noexpandtab */
