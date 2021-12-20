@@ -65,8 +65,6 @@
 #define AUTO_GAIN				-100
 #define DEFAULT_BUFFER_DUMP		4096
 
-#define FREQUENCIES_LIMIT		1024
-
 #define MAX_NUM_CHANNELS  32
 #define RING_COUNT        4
 
@@ -105,6 +103,12 @@ struct multi_demod_state
 	int      w_ring_index;
 	FILE     *fptr[MAX_NUM_CHANNELS];
     FILE     *mpx_fptr[MAX_NUM_CHANNELS];
+	uint32_t freqs[MAX_NUM_CHANNELS];
+	int	  freq_len;
+	int	  exit_flag;
+	int	  freq_now;
+	int	  wb_mode;
+	int split_duration;
 	struct cmd_state	*cmd;
 	pthread_cond_t ready;
 	pthread_mutex_t ready_m;
@@ -136,12 +140,12 @@ struct cmd_state
 	double levelSum;
 	int numSummed;
 	int omitFirstFreqLevels;
-	int waitTrigger[FREQUENCIES_LIMIT];
-	int statNumLevels[FREQUENCIES_LIMIT];
-	uint64_t statFreq[FREQUENCIES_LIMIT];
-	double statSumLevels[FREQUENCIES_LIMIT];
-	float statMinLevel[FREQUENCIES_LIMIT];
-	float statMaxLevel[FREQUENCIES_LIMIT];
+	int waitTrigger[MAX_NUM_CHANNELS];
+	int statNumLevels[MAX_NUM_CHANNELS];
+	uint64_t statFreq[MAX_NUM_CHANNELS];
+	double statSumLevels[MAX_NUM_CHANNELS];
+	float statMinLevel[MAX_NUM_CHANNELS];
+	float statMaxLevel[MAX_NUM_CHANNELS];
 };
 
 struct dongle_state
@@ -169,38 +173,9 @@ struct dongle_state
 	int	  rdc_block_const;	/* parameter for dc_block_raw_filter() */
 };
 
-struct output_state
-{
-	pthread_t thread;
-	FILE	 *file;
-	char	 *filename;
-	char	 *tempfilename;
-	int16_t  result[MAXIMUM_BUF_LENGTH];
-	int	  result_len;
-	int	  rate;
-	pthread_rwlock_t rw;
-	pthread_cond_t ready;
-	pthread_mutex_t ready_m;
-};
-
-struct controller_state
-{
-	int	  exit_flag;
-	pthread_t thread;
-	uint32_t freqs[FREQUENCIES_LIMIT];
-	int	  freq_len;
-	int	  freq_now;
-	int	  wb_mode;
-	pthread_cond_t hop;
-	pthread_mutex_t hop_m;
-	struct cmd_state *cmd;
-};
-
 /* multiple of these, eventually */
 struct dongle_state dongle;
 struct multi_demod_state dm_thr;
-struct output_state output;
-struct controller_state controller;
 struct cmd_state cmd;
 
 
@@ -265,7 +240,7 @@ void usage(void)
 		"\t	omitting the filename also uses stdout\n\n"
 		"Experimental options:\n"
 		"\t[-r resample_rate (default: none / same as -s)]\n"
-		"\t[-t squelch_delay (default: 10)]\n"
+		"\t[-t split duration (default: 60)]\n"
 		"\t	+values will mute/scan, -values will exit\n"
 		"\t[-F fir_size (default: off)]\n"
 		"\t	enables low-leakage downsample filter\n"
@@ -355,7 +330,7 @@ static void cmd_init(struct cmd_state *c)
 	c->levelSum = 0.0;
 	c->numSummed = 0;
 	c->omitFirstFreqLevels = 3;
-	for (k = 0; k < FREQUENCIES_LIMIT; k++) {
+	for (k = 0; k < MAX_NUM_CHANNELS; k++) {
 		c->waitTrigger[k] = 0;
 		c->statNumLevels[k] = 0;
 		c->statFreq[k] = 0;
@@ -511,7 +486,7 @@ static void checkTriggerCommand(struct cmd_state *c, unsigned char adcSampleMax,
 	}
 
 	/* decrease all counters */
-	for ( k = 0; k < FREQUENCIES_LIMIT; k++ ) {
+	for ( k = 0; k < MAX_NUM_CHANNELS; k++ ) {
 		if ( c->waitTrigger[k] > 0 ) {
 			c->waitTrigger[k] -= c->numMeas;
 			if ( c->waitTrigger[k] < 0 )
@@ -522,7 +497,7 @@ static void checkTriggerCommand(struct cmd_state *c, unsigned char adcSampleMax,
 	triggerCommand = testTrigCrit(c, triggerLevel);
 
 	/* update statistics */
-	if ( c->lineNo < FREQUENCIES_LIMIT ) {
+	if ( c->lineNo < MAX_NUM_CHANNELS ) {
 		if ( c->statNumLevels[c->lineNo] == 0 ) {
 			++c->statNumLevels[c->lineNo];
 			c->statFreq[c->lineNo] = c->freq;
@@ -551,7 +526,7 @@ static void checkTriggerCommand(struct cmd_state *c, unsigned char adcSampleMax,
 		sprintf(adcText, "adc rms %5.1f ", adcRms );
 	}
 
-	if ( c->lineNo < FREQUENCIES_LIMIT && c->waitTrigger[c->lineNo] <= 0 ) {
+	if ( c->lineNo < MAX_NUM_CHANNELS && c->waitTrigger[c->lineNo] <= 0 ) {
 			c->waitTrigger[c->lineNo] = triggerCommand ? c->numBlockTrigger : 0;
 			if (verbosity)
 				fprintf(stderr, "%.3f kHz: gain %4.1f + level %4.1f dB %s=> %s\n",
@@ -571,7 +546,7 @@ static void checkTriggerCommand(struct cmd_state *c, unsigned char adcSampleMax,
 	} else if (verbosity) {
 		fprintf(stderr, "%.3f kHz: gain %4.1f + level %4.1f dB %s=> %s, blocks for %d\n",
 			(double)c->freq /1000.0, 0.1*c->gain, triggerLevel, adcText, (triggerCommand ? "would trigger" : "does not trigger"),
-			(c->lineNo < FREQUENCIES_LIMIT ? c->waitTrigger[c->lineNo] : -1 ) );
+			(c->lineNo < MAX_NUM_CHANNELS ? c->waitTrigger[c->lineNo] : -1 ) );
 	}
 	c->numSummed++;
 }
@@ -861,7 +836,7 @@ static void *controller_fn(void *arg)
 	 */
 	int i, r, execWaitHop = 1;
 	int32_t if_band_center_freq = 0;
-	struct controller_state *s = arg;
+	struct multi_demod_state *s = arg;
 	struct cmd_state *c = s->cmd;
 	struct demod_state *demod = dm_thr.config_demod_states;
 
@@ -926,7 +901,7 @@ static void *controller_fn(void *arg)
 	return 0;
 }
 
-void frequency_range(struct controller_state *s, char *arg)
+void frequency_range(struct multi_demod_state *s, char *arg)
 {
 	char *start, *stop, *step;
 	int i;
@@ -939,7 +914,7 @@ void frequency_range(struct controller_state *s, char *arg)
 	{
 		s->freqs[s->freq_len] = (uint32_t)i;
 		s->freq_len++;
-		if (s->freq_len >= FREQUENCIES_LIMIT) {
+		if (s->freq_len >= MAX_NUM_CHANNELS) {
 			break;}
 	}
 	stop[-1] = ':';
@@ -1011,6 +986,7 @@ void multi_demod_thread_init(struct multi_demod_state *s, struct cmd_state *cmd)
         get_nprocs_conf(), get_nprocs());
 	s->r_ring_index = 0;
 	s->w_ring_index = 0;
+	s->split_duration = 60;
 	pthread_rwlock_init(&s->rw, NULL);
 	pthread_cond_init(&s->ready, NULL);
 	pthread_mutex_init(&s->ready_m, NULL);
@@ -1041,46 +1017,15 @@ void demod_thread_cleanup(struct multi_demod_state *s)
 	pthread_mutex_destroy(&s->ready_m);
 }
 
-void output_init(struct output_state *s)
-{
-	s->rate = DEFAULT_SAMPLE_RATE;
-	pthread_rwlock_init(&s->rw, NULL);
-	pthread_cond_init(&s->ready, NULL);
-	pthread_mutex_init(&s->ready_m, NULL);
-}
-
-void output_cleanup(struct output_state *s)
-{
-	pthread_rwlock_destroy(&s->rw);
-	pthread_cond_destroy(&s->ready);
-	pthread_mutex_destroy(&s->ready_m);
-}
-
-void controller_init(struct controller_state *s)
-{
-	s->freqs[0] = 100000000;
-	s->freq_len = 0;
-	s->wb_mode = 0;
-	pthread_cond_init(&s->hop, NULL);
-	pthread_mutex_init(&s->hop_m, NULL);
-	s->cmd = &cmd;
-}
-
-void controller_cleanup(struct controller_state *s)
-{
-	pthread_cond_destroy(&s->hop);
-	pthread_mutex_destroy(&s->hop_m);
-}
-
 void sanity_checks(void)
 {
-	if (controller.freq_len == 0) {
+	if (dm_thr.freq_len == 0) {
 		fprintf(stderr, "Please specify a frequency.\n");
 		exit(1);
 	}
 
-	if (controller.freq_len >= FREQUENCIES_LIMIT) {
-		fprintf(stderr, "Too many channels, maximum %i.\n", FREQUENCIES_LIMIT);
+	if (dm_thr.freq_len >= MAX_NUM_CHANNELS) {
+		fprintf(stderr, "Too many channels, maximum %i.\n", MAX_NUM_CHANNELS);
 		exit(1);
 	}
 
@@ -1111,21 +1056,21 @@ int main(int argc, char **argv)
 	multi_demod_thread_init(&dm_thr, &cmd);
 	cmd_init(&cmd);
 
-	while ((opt = getopt(argc, argv, "d:f:g:s:b:o:r:p:R:E:O:F:A:M:hTC:B:m:L:q:c:w:W:D:nHv")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:g:s:b:o:r:t:p:R:E:O:F:A:M:hTC:B:m:L:q:c:w:W:D:nHv")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
 			dev_given = 1;
 			break;
 		case 'f':
-			if (controller.freq_len >= FREQUENCIES_LIMIT) {
+			if (dm_thr.freq_len >= MAX_NUM_CHANNELS) {
 				break;}
 			if (strchr(optarg, ':'))
-				{frequency_range(&controller, optarg);}
+				{frequency_range(&dm_thr, optarg);}
 			else
 			{
-				controller.freqs[controller.freq_len] = (uint32_t)atofs(optarg);
-				controller.freq_len++;
+				dm_thr.freqs[dm_thr.freq_len] = (uint32_t)atofs(optarg);
+				dm_thr.freq_len++;
 			}
 			break;
 		case 'C':
@@ -1141,6 +1086,9 @@ int main(int argc, char **argv)
 		case 'n':
 			OutputToStdout = 0;
 			break;
+		case 't':
+			dm_thr.split_duration = atoi(optarg);
+			break;
 		case 'g':
 			dongle.gain = (int)(atof(optarg) * 10);
 			break;
@@ -1152,7 +1100,6 @@ int main(int argc, char **argv)
 			demod->rate_out = (uint32_t)atofs(optarg);
 			break;
 		case 'r':
-			output.rate = (int)atofs(optarg);
 			demod->rate_out2 = (int)atofs(optarg);
 			break;
 		case 'o':
@@ -1219,12 +1166,11 @@ int main(int argc, char **argv)
 			if (strcmp("lsb", optarg) == 0) {
 				demod->mode_demod = &lsb_demod;}
 			if (strcmp("wbfm",  optarg) == 0 || strcmp("wfm",  optarg) == 0) {
-				controller.wb_mode = 1;
+				dm_thr.wb_mode = 1;
 				demod->mode_demod = &fm_demod;
 				demod->rate_in = 170000;
 				demod->rate_out = 170000;
 				demod->rate_out2 = 32000;
-				output.rate = 32000;
 				demod->custom_atan = 1;
 				//demod.post_downsample = 4;
 				demod->deemph = 1;
@@ -1278,19 +1224,10 @@ int main(int argc, char **argv)
 	/* quadruple sample_rate to limit to Δθ to ±π/2 */
 	demod->rate_in *= demod->post_downsample;
 
-	if (!output.rate) {
-		output.rate = demod->rate_out;}
-
 	sanity_checks();
 
-	if (controller.freq_len > 1) {
+	if (dm_thr.freq_len > 1) {
 		demod->terminate_on_squelch = 0;}
-
-	if (optind < argc) {
-		output.filename = argv[optind];
-	} else {
-		output.filename = "-";
-	}
 
 	ACTUAL_BUF_LENGTH = lcm_post[demod->post_downsample] * DEFAULT_BUF_LENGTH;
 
@@ -1366,44 +1303,13 @@ int main(int argc, char **argv)
 		rtlsdr_set_opt_string(dongle.dev, rtlOpts, verbosity);
 	}
 
-	if (strcmp(output.filename, "-") == 0) { /* Write samples to stdout */
-		output.file = stdout;
-#ifdef _WIN32
-		_setmode(_fileno(output.file), _O_BINARY);
-#endif
-	} else {
-		const char * filename_to_open = output.filename;
-		if (writeWav) {
-			output.tempfilename = malloc( strlen(output.filename)+8 );
-			strcpy(output.tempfilename, output.filename);
-			strcat(output.tempfilename, ".tmp");
-			filename_to_open = output.tempfilename;
-		}
- 		output.file = fopen(filename_to_open, "wb");
-		if (!output.file) {
-			fprintf(stderr, "Failed to open %s\n", filename_to_open);
-			exit(1);
-		}
-		else
-		{
-			fprintf(stderr, "Open %s for write\n", filename_to_open);
-			if (writeWav) {
-				int nChan = (demod->mode_demod == &raw_demod) ? 2 : 1;
-				int srate = (demod->rate_out2 > 0) ? demod->rate_out2 : demod->rate_out;
-				uint32_t f = controller.freqs[0];	/* only 1st frequency!!! */
-				waveWriteHeader(srate, f, 16, nChan, output.file);
-			}
-		}
-	}
-
 	//r = rtlsdr_set_testmode(dongle.dev, 1);
 
 	/* Reset endpoint before we start reading from it (mandatory) */
 	verbose_reset_buffer(dongle.dev);
 
-	controller_fn(&controller);
+	controller_fn(&dm_thr);
 	usleep(1000000); /* it looks, that startup of dongle level takes some time at startup! */
-	pthread_create(&output.thread, NULL, output_thread_fn, (void *)(&output));
 	pthread_create(&dm_thr.thread, NULL, demod_thread_fn, (void *)(&dm_thr));
 	pthread_create(&dongle.thread, NULL, dongle_thread_fn, (void *)(&dongle));
 
@@ -1420,37 +1326,16 @@ int main(int argc, char **argv)
 	pthread_join(dongle.thread, NULL);
 	safe_cond_signal(&dm_thr.ready, &dm_thr.ready_m);
 	pthread_join(dm_thr.thread, NULL);
-	safe_cond_signal(&output.ready, &output.ready_m);
-	pthread_join(output.thread, NULL);
-	safe_cond_signal(&controller.hop, &controller.hop_m);
-	pthread_join(controller.thread, NULL);
 
 	/* dongle_cleanup(&dongle); */
 	demod_thread_cleanup(&dm_thr);
-	output_cleanup(&output);
-	controller_cleanup(&controller);
 
 	if (cmd.filename) {
 		int k;
 		/* output scan statistics */
-		for (k = 0; k < FREQUENCIES_LIMIT; k++) {
+		for (k = 0; k < MAX_NUM_CHANNELS; k++) {
 			if (cmd.statNumLevels[k] > 0)
 				fprintf(stderr, "%.0f, %.1f, %.2f, %.1f\n", (double)(cmd.statFreq[k]), cmd.statMinLevel[k], cmd.statSumLevels[k] / cmd.statNumLevels[k], cmd.statMaxLevel[k] );
-		}
-	}
-
-	if (output.file != stdout) {
-		if (writeWav) {
-			int r;
-			waveFinalizeHeader(output.file);
-			fclose(output.file);
-			remove(output.filename);	/* delete, in case file already exists */
-			r = rename( output.tempfilename, output.filename );	/* #include <stdio.h> */
-			if ( r )
-				fprintf( stderr, "%s: error %d '%s' renaming'%s' to '%s'\n"
-					, argv[0], errno, strerror(errno), output.tempfilename, output.filename );
-		} else {
-			fclose(output.file);
 		}
 	}
 
