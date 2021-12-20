@@ -52,6 +52,8 @@
 #include <pthread.h>
 #include <libusb.h>
 
+#include <sys/sysinfo.h>
+
 #include <rtl-sdr.h>
 #include <rtl_app_ver.h>
 #include "convenience/convenience.h"
@@ -64,6 +66,9 @@
 #define DEFAULT_BUFFER_DUMP		4096
 
 #define FREQUENCIES_LIMIT		1024
+
+#define MAX_NUM_CHANNELS  32
+#define RING_COUNT        4
 
 static int BufferDump = DEFAULT_BUFFER_DUMP;
 static int OutputToStdout = 1;
@@ -88,18 +93,25 @@ char * aCritStr[] = { "in", "out", "<", ">" };
 time_t stop_time;
 int duration = 0;
 
-
-struct demod_thread_state
+struct multi_demod_state
 {
-	pthread_t		thread;
-	pthread_rwlock_t	rw;
-	pthread_cond_t		ready;
-	pthread_mutex_t	ready_m;
-	struct output_state	*output_target;
+	struct demod_state *config_demod_states; //its just for keeping configs
+	struct demod_state demod_states[MAX_NUM_CHANNELS];
+	pthread_t thread;
+	int channel_count;
+	int16_t  lowpassed[RING_COUNT][MAXIMUM_BUF_LENGTH];
+	int      lp_len;
+	int      r_ring_index;
+	int      w_ring_index;
+	FILE     *fptr[MAX_NUM_CHANNELS];
+    FILE     *mpx_fptr[MAX_NUM_CHANNELS];
 	struct cmd_state	*cmd;
-
-	struct demod_state demod;
+	pthread_cond_t ready;
+	pthread_mutex_t ready_m;
+	pthread_rwlock_t rw;
+	struct output_state *output_target;
 };
+
 
 struct cmd_state
 {
@@ -141,15 +153,13 @@ struct dongle_state
 	uint64_t freq;
 	uint32_t rate;
 	uint32_t bandwidth;
-	int	  bccorner;  /* -1 for low band corner, 0 for band center, +1 for high band corner */
 	int	  gain;
 	int16_t  buf16[MAXIMUM_BUF_LENGTH];
 	uint32_t buf_len;
 	int	  ppm_error;
-	int	  offset_tuning;
 	int	  direct_sampling;
 	int	  mute;
-	struct demod_thread_state *demod_target;
+	struct multi_demod_state *demod_target;
 	double samplePowSum;
 	int samplePowCount;
 	unsigned char sampleMax;
@@ -180,7 +190,6 @@ struct controller_state
 	uint32_t freqs[FREQUENCIES_LIMIT];
 	int	  freq_len;
 	int	  freq_now;
-	int	  edge;
 	int	  wb_mode;
 	pthread_cond_t hop;
 	pthread_mutex_t hop_m;
@@ -189,7 +198,7 @@ struct controller_state
 
 /* multiple of these, eventually */
 struct dongle_state dongle;
-struct demod_thread_state dm_thr;
+struct multi_demod_state dm_thr;
 struct output_state output;
 struct controller_state controller;
 struct cmd_state cmd;
@@ -240,7 +249,6 @@ void usage(void)
 		"\t[-R run_seconds] specify number of seconds to run\n"
 		"\t[-E enable_option (default: none)]\n"
 		"\t	use multiple -E to enable multiple options\n"
-		"\t	edge:   enable lower edge tuning\n"
 		"\t	rdc:    enable dc blocking filter on raw I/Q data at capture rate\n"
 		"\t	adc:    enable dc blocking filter on demodulated audio\n"
 		"\t	dc:     same as adc\n"
@@ -248,10 +256,6 @@ void usage(void)
 		"\t	agc:    same as rtlagc\n"
 		"\t	deemp:  enable de-emphasis filter\n"
 		"\t	direct: enable direct sampling (bypasses tuner, uses rtl2832 xtal)\n"
-		"\t	offset: enable offset tuning (only e4000 tuner)\n"
-		"\t	bcc:    use tuner bandwidths center as band center (default)\n"
-		"\t	bclo:   use tuner bandwidths low  corner as band center\n"
-		"\t	bchi:   use tuner bandwidths high corner as band center\n"
 		"%s"
 		"\t[-q dc_avg_factor for option rdc (default: 9)]\n"
 		"\t[-n disables demodulation output to stdout/file]\n"
@@ -573,10 +577,10 @@ static void checkTriggerCommand(struct cmd_state *c, unsigned char adcSampleMax,
 }
 
 
-void full_demod(struct demod_thread_state *dt)
+void full_demod(struct demod_state *d)
 {
-	struct cmd_state *c = dt->cmd;
-	struct demod_state *d = &dt->demod;
+	struct cmd_state *c = dm_thr.cmd;//??????????????????????????????????????????????????????????????????????????????
+	//struct demod_state *d = &dt->demod;
 	double freqK, avgRms, rmsLevel, avgRmsLevel;
 	int sr = 0;
 	static int printBlockLen = 1;
@@ -722,9 +726,9 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 	if (muteLen && c->filename)
 		return;	/* "mute" after the dc_block_raw_filter(), giving it time to remove the new DC */
 	/* 3rd: down-mixing */
-	if (!s->offset_tuning) {
-		rotate16_neg90(s->buf16, (int)len);
-	}
+	//if (!s->offset_tuning) { //fixme ?? offset tuning kalktı duracak mı?
+	rotate16_neg90(s->buf16, (int)len);
+	//}
 
 	pthread_rwlock_wrlock(&dt->rw);
 	memcpy(dt->demod.lowpassed, s->buf16, 2*len);
@@ -803,54 +807,54 @@ static void *output_thread_fn(void *arg)
 	return 0;
 }
 
-static void optimal_settings(uint64_t freq, uint32_t rate)
-{
-	/* giant ball of hacks
-	 * seems unable to do a single pass, 2:1
-	 */
-	uint64_t capture_freq;
-	uint32_t capture_rate;
-	struct dongle_state *d = &dongle;
-	struct demod_thread_state *dt = &dm_thr;
-	struct demod_state *dm = &dt->demod;
-	struct controller_state *cs = &controller;
-	dm->downsample = (MinCaptureRate / dm->rate_in) + 1;
-	if (dm->downsample_passes) {
-		dm->downsample_passes = (int)log2(dm->downsample) + 1;
-		if (dm->downsample_passes > MAXIMUM_DOWNSAMPLE_PASSES) {
-			fprintf(stderr, "downsample_passes = %d exceeds it's limit. setting to %d\n", dm->downsample, MAXIMUM_DOWNSAMPLE_PASSES);
-			dm->downsample_passes = MAXIMUM_DOWNSAMPLE_PASSES;
-		}
-		dm->downsample = 1 << dm->downsample_passes;
-	}
-	if (verbosity >= 2) {
-		fprintf(stderr, "downsample_passes = %d (= # of fifth_order() iterations), downsample = %d\n", dm->downsample_passes, dm->downsample );
-	}
-	capture_freq = freq;
-	capture_rate = dm->downsample * dm->rate_in;
-	if (verbosity >= 2)
-		fprintf(stderr, "capture_rate = dm->downsample * dm->rate_in = %d * %d = %d\n", dm->downsample, dm->rate_in, capture_rate );
-	if (!d->offset_tuning) {
-		capture_freq = freq - capture_rate/4;
-		if (verbosity >= 2)
-			fprintf(stderr, "optimal_settings(freq = %f MHz): capture_freq = freq - capture_rate/4 = %f MHz\n", freq * 1E-6, capture_freq * 1E-6 );
-	}
-	capture_freq += cs->edge * dm->rate_in / 2;
-	if (verbosity >= 2)
-		fprintf(stderr, "optimal_settings(freq = %f MHz): capture_freq +=  cs->edge * dm->rate_in / 2 = %d * %d / 2 = %f MHz\n", freq * 1E-6, cs->edge, dm->rate_in, capture_freq * 1E-6 );
-	dm->output_scale = (1<<15) / (128 * dm->downsample);
-	if (dm->output_scale < 1) {
-		dm->output_scale = 1;}
-	if (dm->mode_demod == &fm_demod) {
-		dm->output_scale = 1;}
-	d->userFreq = freq;
-	d->freq = capture_freq;
-	d->rate = capture_rate;
-	if (verbosity >= 2)
-		fprintf(stderr, "optimal_settings(freq = %f MHz) delivers freq %f MHz, rate %.0f\n", freq * 1E-6, d->freq * 1E-6, (double)d->rate );
-}
+// static void optimal_settings(uint64_t freq, uint32_t rate)
+// {
+// 	/* giant ball of hacks
+// 	 * seems unable to do a single pass, 2:1
+// 	 */
+// 	uint64_t capture_freq;
+// 	uint32_t capture_rate;
+// 	struct dongle_state *d = &dongle;
+// 	struct demod_thread_state *dt = &dm_thr;
+// 	struct demod_state *dm = &dt->demod;
+// 	struct controller_state *cs = &controller;
+// 	dm->downsample = (MinCaptureRate / dm->rate_in) + 1;
+// 	if (dm->downsample_passes) {
+// 		dm->downsample_passes = (int)log2(dm->downsample) + 1;
+// 		if (dm->downsample_passes > MAXIMUM_DOWNSAMPLE_PASSES) {
+// 			fprintf(stderr, "downsample_passes = %d exceeds it's limit. setting to %d\n", dm->downsample, MAXIMUM_DOWNSAMPLE_PASSES);
+// 			dm->downsample_passes = MAXIMUM_DOWNSAMPLE_PASSES;
+// 		}
+// 		dm->downsample = 1 << dm->downsample_passes;
+// 	}
+// 	if (verbosity >= 2) {
+// 		fprintf(stderr, "downsample_passes = %d (= # of fifth_order() iterations), downsample = %d\n", dm->downsample_passes, dm->downsample );
+// 	}
+// 	capture_freq = freq;
+// 	capture_rate = dm->downsample * dm->rate_in;
+// 	if (verbosity >= 2)
+// 		fprintf(stderr, "capture_rate = dm->downsample * dm->rate_in = %d * %d = %d\n", dm->downsample, dm->rate_in, capture_rate );
+// 	//if (!d->offset_tuning) { //fixme kalacak mı?
+// 		capture_freq = freq - capture_rate/4;
+// 		if (verbosity >= 2)
+// 			fprintf(stderr, "optimal_settings(freq = %f MHz): capture_freq = freq - capture_rate/4 = %f MHz\n", freq * 1E-6, capture_freq * 1E-6 );
+// 	//}
+// 	capture_freq += cs->edge * dm->rate_in / 2;
+// 	if (verbosity >= 2)
+// 		fprintf(stderr, "optimal_settings(freq = %f MHz): capture_freq +=  cs->edge * dm->rate_in / 2 = %d * %d / 2 = %f MHz\n", freq * 1E-6, cs->edge, dm->rate_in, capture_freq * 1E-6 );
+// 	dm->output_scale = (1<<15) / (128 * dm->downsample);
+// 	if (dm->output_scale < 1) {
+// 		dm->output_scale = 1;}
+// 	if (dm->mode_demod == &fm_demod) {
+// 		dm->output_scale = 1;}
+// 	d->userFreq = freq;
+// 	d->freq = capture_freq;
+// 	d->rate = capture_rate;
+// 	if (verbosity >= 2)
+// 		fprintf(stderr, "optimal_settings(freq = %f MHz) delivers freq %f MHz, rate %.0f\n", freq * 1E-6, d->freq * 1E-6, (double)d->rate );
+// }
 
-static void *controller_thread_fn(void *arg)
+static void *controller_fn(void *arg)
 {
 	/* thoughts for multiple dongles
 	 * might be no good using a controller thread if retune/rate blocks
@@ -859,7 +863,7 @@ static void *controller_thread_fn(void *arg)
 	int32_t if_band_center_freq = 0;
 	struct controller_state *s = arg;
 	struct cmd_state *c = s->cmd;
-	struct demod_state *demod = &dm_thr.demod;
+	struct demod_state *demod = dm_thr.config_demod_states;
 
 	if (s->wb_mode) {
 		if (verbosity)
@@ -877,18 +881,18 @@ static void *controller_thread_fn(void *arg)
 		execWaitHop = 0;
 	}
 
-	optimal_settings(s->freqs[0], demod->rate_in);
+	//optimal_settings(s->freqs[0], demod->rate_in);
 	if (dongle.direct_sampling) {
 		verbose_direct_sampling(dongle.dev, 1);}
-	if (dongle.offset_tuning) {
-		verbose_offset_tuning(dongle.dev);}
+	//if (dongle.offset_tuning) {
+	//	verbose_offset_tuning(dongle.dev);}
 
 	/* Set the frequency */
-	if (verbosity) {
+	/* if (verbosity) {
 		fprintf(stderr, "verbose_set_frequency(%f MHz)\n", dongle.userFreq * 1E-6);
 		if (!dongle.offset_tuning)
 			fprintf(stderr, "  frequency is away from parametrized one, to avoid negative impact from dc\n");
-	}
+	} */
 	verbose_set_frequency(dongle.dev, dongle.freq);
 	fprintf(stderr, "Oversampling input by: %ix.\n", demod->downsample);
 	fprintf(stderr, "Oversampling output by: %ix.\n", demod->post_downsample);
@@ -901,7 +905,7 @@ static void *controller_thread_fn(void *arg)
 	verbose_set_sample_rate(dongle.dev, dongle.rate);
 	fprintf(stderr, "Output at %u Hz.\n", demod->rate_in/demod->post_downsample);
 
-	if ( dongle.bandwidth ) {
+	/* if ( dongle.bandwidth ) {
 		if_band_center_freq = dongle.userFreq - dongle.freq;
 		if (dongle.bccorner < 0)
 			if_band_center_freq += ( dongle.bandwidth - demod->rate_out ) / 2;
@@ -918,110 +922,7 @@ static void *controller_thread_fn(void *arg)
 					fprintf(stderr, "rtlsdr_set_tuner_band_center(%.0f Hz) successful\n", (double)if_band_center_freq);
 			}
 		}
-	}
-
-	while (!do_exit) {
-		if (execWaitHop)
-			safe_cond_wait(&s->hop, &s->hop_m);
-		execWaitHop = 1;  /* execute following safe_cond_wait()'s */
-		/* fprintf(stderr, "\nreceived hop condition\n"); */
-		if (s->freq_len <= 1 && !c->filename) {
-			continue;}
-		if (!c->filename) {
-			/* hacky hopping */
-			s->freq_now = (s->freq_now + 1) % s->freq_len;
-			optimal_settings(s->freqs[s->freq_now], demod->rate_in);
-			rtlsdr_set_center_freq64(dongle.dev, dongle.freq);
-			if ( dongle.bandwidth ) {
-				if_band_center_freq = dongle.userFreq - dongle.freq;
-				if ( prev_if_band_center_freq != if_band_center_freq ) {
-					r = rtlsdr_set_tuner_band_center(dongle.dev, if_band_center_freq );
-					if (r)
-						fprintf(stderr, "WARNING: Failed to set band center.\n");
-					else {
-						prev_if_band_center_freq = if_band_center_freq;
-						if (verbosity)
-							fprintf(stderr, "rtlsdr_set_tuner_band_center(%.0f Hz) successful\n", (double)if_band_center_freq);
-					}
-				}
-			}
-			dongle.mute = DEFAULT_BUFFER_DUMP;
-		} else {
-			dongle.mute = 2 * dongle.rate; /* over a second - until parametrized the dongle */
-			c->numSummed = 0;
-
-			toNextCmdLine(c);
-
-			optimal_settings(c->freq, demod->rate_in);
-			/* 1- set center frequency */
-			if (c->prevFreq != dongle.freq) {
-				rtlsdr_set_center_freq64(dongle.dev, dongle.freq);
-				c->prevFreq = dongle.freq;
-			}
-			/* 2- Set the tuner gain */
-			if (c->prevGain != c->gain) {
-				if (c->gain == AUTO_GAIN) {
-					r = rtlsdr_set_tuner_gain_mode(dongle.dev, 0);
-					if (r != 0)
-						fprintf(stderr, "WARNING: Failed to set automatic tuner gain.\n");
-					else
-						c->prevGain = c->gain;
-				} else {
-					c->gain = nearest_gain(dongle.dev, c->gain);
-					r = rtlsdr_set_tuner_gain_mode(dongle.dev, 1);
-					if (r < 0)
-						fprintf(stderr, "WARNING: Failed to enable manual gain.\n");
-					else {
-						r = rtlsdr_set_tuner_gain(dongle.dev, c->gain);
-						if (r != 0)
-							fprintf(stderr, "WARNING: Failed to set tuner gain.\n");
-						else
-							c->prevGain = c->gain;
-					}
-				}
-			}
-			/* 3- Set tuner bandwidth */
-			if (c->prevBandwidth != dongle.bandwidth) {
-				r = rtlsdr_set_tuner_bandwidth(dongle.dev, dongle.bandwidth);
-				if (r < 0)
-					fprintf(stderr, "WARNING: Failed to set bandwidth.\n");
-				else
-					c->prevBandwidth = dongle.bandwidth;
-			}
-			/*  */
-			if ( dongle.bandwidth ) {
-				if_band_center_freq = dongle.userFreq - dongle.freq;
-				if ( prev_if_band_center_freq != if_band_center_freq ) {
-					r = rtlsdr_set_tuner_band_center(dongle.dev, if_band_center_freq );
-					if (r)
-						fprintf(stderr, "WARNING: Failed to set band center.\n");
-					else {
-						prev_if_band_center_freq = if_band_center_freq;
-						if (verbosity)
-							fprintf(stderr, "rtlsdr_set_tuner_band_center(%.0f Hz) successful\n", (double)if_band_center_freq);
-					}
-				}
-			}
-			/* 4- Set ADC samplerate *
-			r = rtlsdr_set_sample_rate(dongle.dev, dongle.rate);
-			if (r < 0)
-				fprintf(stderr, "WARNING: Failed to set sample rate.\n");
-			*/
-
-			c->levelSum = 0;
-			c->numSummed = 0;
-			/* reset DC filters */
-			demod->adc_avg = 0;
-			dongle.rdc_avg[0] = 0;
-			dongle.rdc_avg[1] = 0;
-			dongle.mute = BufferDump;
-			/* reset adc max and power */
-			dongle.samplePowSum = 0.0;
-			dongle.samplePowCount = 0;
-			dongle.sampleMax = 0;
-		}
-
-	}
+	} */
 	return 0;
 }
 
@@ -1051,13 +952,11 @@ void dongle_init(struct dongle_state *s)
 	s->gain = AUTO_GAIN; /* tenths of a dB */
 	s->mute = 0;
 	s->direct_sampling = 0;
-	s->offset_tuning = 0;
 	s->demod_target = &dm_thr;
 	s->samplePowSum = 0.0;
 	s->samplePowCount = 0;
 	s->sampleMax = 0;
 	s->bandwidth = 0;
-	s->bccorner = 0;
 	s->buf_len = 32 * 512;  /* see rtl_tcp */
 
 	s->dc_block_raw = 0;
@@ -1066,17 +965,76 @@ void dongle_init(struct dongle_state *s)
 	s->rdc_block_const = 9;
 }
 
-void demod_thread_init(struct demod_thread_state *s, struct output_state *output, struct cmd_state *cmd)
+void init_demods() {
+	struct demod_state *conf = dm_thr.config_demod_states; 
+	for(int i=0; i<dm_thr.channel_count; i++) {
+		struct demod_state *s = &dm_thr.demod_states[i];
+		s->comp_fir_size = conf->comp_fir_size;
+		s->rate_in = conf->rate_in;
+		s->rate_out = conf->rate_out;
+		s->rate_out2 = conf->rate_out2;
+		s->downsample = conf->downsample;
+		s->downsample_passes = conf->downsample_passes;
+		s->post_downsample = conf->post_downsample;
+		s->squelch_level = conf->squelch_level;
+		s->conseq_squelch = conf->conseq_squelch;
+		s->terminate_on_squelch = conf->terminate_on_squelch;
+		s->squelch_hits = conf->squelch_hits;
+		s->custom_atan = conf->custom_atan;
+		s->pre_j = conf->pre_j;
+		s->pre_r = conf->pre_r;
+		s->mode_demod = conf->mode_demod;
+		s->lp_index = conf->lp_index;
+		s->lp_sum_r = conf->lp_sum_r;
+		s->lp_sum_j = conf->lp_sum_j;
+		s->lpr_index = conf->lpr_index;
+		s->lpr_sum = conf->lpr_sum;
+		s->deemph = conf->deemph;
+		s->deemph_a = conf->deemph_a;
+		s->deemph_avg = conf->deemph_avg;
+		s->dc_block_audio = conf->dc_block_audio;
+		s->adc_avg = conf->adc_avg;
+		s->adc_block_const = conf->adc_block_const;
+		s->omit_dc_fix = conf->omit_dc_fix;
+	}
+}
+
+void multi_demod_thread_init(struct multi_demod_state *s, struct cmd_state *cmd)
 {
-	demod_init(&s->demod);
+	char *file_name;
+
+	demod_init(s->config_demod_states); //just for config arranging
+
+	s->channel_count = get_nprocs()-2;
+	printf("This system has %d processors configured and "
+        "%d processors available.\n",
+        get_nprocs_conf(), get_nprocs());
+	s->r_ring_index = 0;
+	s->w_ring_index = 0;
 	pthread_rwlock_init(&s->rw, NULL);
 	pthread_cond_init(&s->ready, NULL);
 	pthread_mutex_init(&s->ready_m, NULL);
-	s->output_target = output;
+	file_name = (char *) malloc(100 * sizeof(char));
+	memset(file_name, 0, 100);
+	for(int i=0; i<s->channel_count; i++) {
+	    sprintf(file_name, "%d.wav", i);
+		s->fptr[i] = fopen(file_name, "wb");
+		
+    	sprintf(file_name, "%d_mpx.wav", i);
+		s->mpx_fptr[i] = fopen(file_name, "wb");
+
+		if(&s->demod_states[i])
+			exit(0);
+	}
+	free(file_name);
+
+	pthread_rwlock_init(&s->rw, NULL);
+	pthread_cond_init(&s->ready, NULL);
+	pthread_mutex_init(&s->ready_m, NULL);
 	s->cmd = cmd;
 }
 
-void demod_thread_cleanup(struct demod_thread_state *s)
+void demod_thread_cleanup(struct multi_demod_state *s)
 {
 	pthread_rwlock_destroy(&s->rw);
 	pthread_cond_destroy(&s->ready);
@@ -1102,7 +1060,6 @@ void controller_init(struct controller_state *s)
 {
 	s->freqs[0] = 100000000;
 	s->freq_len = 0;
-	s->edge = 0;
 	s->wb_mode = 0;
 	pthread_cond_init(&s->hop, NULL);
 	pthread_mutex_init(&s->hop_m, NULL);
@@ -1127,10 +1084,10 @@ void sanity_checks(void)
 		exit(1);
 	}
 
-	if (controller.freq_len > 1 && dm_thr.demod.squelch_level == 0) {
+	/* if (controller.freq_len > 1 && dm_thr.demod.squelch_level == 0) {
 		fprintf(stderr, "Please specify a squelch level.  Required for scanning multiple frequencies.\n");
 		exit(1);
-	}
+	} */
 
 }
 
@@ -1149,14 +1106,12 @@ int main(int argc, char **argv)
 	uint32_t ds_temp, ds_threshold = 0;
 	int timeConstant = 75; /* default: U.S. 75 uS */
 	int rtlagc = 0;
-	struct demod_state *demod = &dm_thr.demod;
+	struct demod_state *demod = dm_thr.config_demod_states;
 	dongle_init(&dongle);
-	demod_thread_init(&dm_thr, &output, &cmd);
-	output_init(&output);
-	controller_init(&controller);
+	multi_demod_thread_init(&dm_thr, &cmd);
 	cmd_init(&cmd);
 
-	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:o:t:r:p:R:E:O:F:A:M:hTC:B:m:L:q:c:w:W:D:nHv")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:g:s:b:o:r:p:R:E:O:F:A:M:hTC:B:m:L:q:c:w:W:D:nHv")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
@@ -1189,9 +1144,6 @@ int main(int argc, char **argv)
 		case 'g':
 			dongle.gain = (int)(atof(optarg) * 10);
 			break;
-		case 'l':
-			demod->squelch_level = (int)atof(optarg);
-			break;
 		case 'L':
 			printLevels = (int)atof(optarg);
 			break;
@@ -1209,13 +1161,6 @@ int main(int argc, char **argv)
 			if (demod->post_downsample < 1 || demod->post_downsample > MAXIMUM_OVERSAMPLE) {
 				fprintf(stderr, "Oversample must be between 1 and %i\n", MAXIMUM_OVERSAMPLE);}
 			break;
-		case 't':
-			demod->conseq_squelch = (int)atof(optarg);
-			if (demod->conseq_squelch < 0) {
-				demod->conseq_squelch = -demod->conseq_squelch;
-				demod->terminate_on_squelch = 1;
-			}
-			break;
 		case 'p':
 			dongle.ppm_error = atoi(optarg);
 			custom_ppm = 1;
@@ -1230,8 +1175,6 @@ int main(int argc, char **argv)
 			}
 			break;
 		case 'E':
-			if (strcmp("edge",  optarg) == 0) {
-				controller.edge = 1;}
 			if (strcmp("dc", optarg) == 0 || strcmp("adc", optarg) == 0) {
 				demod->dc_block_audio = 1;}
 			if (strcmp("rdc", optarg) == 0) {
@@ -1240,16 +1183,8 @@ int main(int argc, char **argv)
 				demod->deemph = 1;}
 			if (strcmp("direct",  optarg) == 0) {
 				dongle.direct_sampling = 1;}
-			if (strcmp("offset",  optarg) == 0) {
-				dongle.offset_tuning = 1;}
 			if (strcmp("rtlagc", optarg) == 0 || strcmp("agc", optarg) == 0) {
 				rtlagc = 1;}
-			if (strcmp("bclo", optarg) == 0 || strcmp("bcL", optarg) == 0 || strcmp("bcl", optarg) == 0) {
-				dongle.bccorner = -1; }
-			if (strcmp("bcc", optarg) == 0 || strcmp("bcC", optarg) == 0) {
-				dongle.bccorner = 0; }
-			if (strcmp("bchi", optarg) == 0 || strcmp("bcH", optarg) == 0 || strcmp("bch", optarg) == 0) {
-				dongle.bccorner = 1; }
 			break;
 		case 'O':
 			rtlOpts = optarg;
@@ -1334,6 +1269,8 @@ int main(int argc, char **argv)
 			break;
 		}
 	}
+
+	init_demods();
 
 	if (verbosity)
 		fprintf(stderr, "verbosity set to %d\n", verbosity);
@@ -1464,7 +1401,7 @@ int main(int argc, char **argv)
 	/* Reset endpoint before we start reading from it (mandatory) */
 	verbose_reset_buffer(dongle.dev);
 
-	pthread_create(&controller.thread, NULL, controller_thread_fn, (void *)(&controller));
+	controller_fn(&controller);
 	usleep(1000000); /* it looks, that startup of dongle level takes some time at startup! */
 	pthread_create(&output.thread, NULL, output_thread_fn, (void *)(&output));
 	pthread_create(&dm_thr.thread, NULL, demod_thread_fn, (void *)(&dm_thr));
