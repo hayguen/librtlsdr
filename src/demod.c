@@ -53,6 +53,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
 
 #ifdef _WIN32
 #if defined(_MSC_VER) && (_MSC_VER < 1800)
@@ -65,8 +66,9 @@
 
 #define DEFAULT_SAMPLE_RATE		24000
 
-static int *atan_lut = NULL;    /* @todo: -> 16 bit to reduce CPU cache consumption */
-static int atan_lut_size = 131072; /* 512 KB */
+typedef int16_t lut_type;  /* 16 bit reduces CPU cache consumption */
+static lut_type *atan_lut_tab = NULL;
+static int atan_lut_size = 131072; /* => 256 KB for int16_t , 512 KB for int32_t */
 static int atan_lut_coef = 8;
 
 
@@ -183,26 +185,26 @@ void rotate_neg90(unsigned char *buf, uint32_t len)
 void low_pass(struct demod_state *d)
 /* simple square window FIR */
 {
-	int i=0, i2=0;
+	int16_t *lowpassed = d->lowpassed;
+	const int lp_len = d->lp_len;
 	const int downsample = d->downsample;
+	int i=0, i2=0;
 	int lp_index = d->lp_index;
 	int lp_sum_r = d->lp_sum_r;
 	int lp_sum_j = d->lp_sum_j;
 
-	while (i < d->lp_len) {
-		lp_sum_r += d->lowpassed[i];
-		lp_sum_j += d->lowpassed[i+1];
-		i += 2;
+	while (i < lp_len) {
+		lp_sum_r += lowpassed[i++];
+		lp_sum_j += lowpassed[i++];
 		lp_index++;
 		if (lp_index < downsample) {
 			continue;
 		}
-		d->lowpassed[i2]   = lp_sum_r; /* * d->output_scale; */
-		d->lowpassed[i2+1] = lp_sum_j; /* * d->output_scale; */
+		lowpassed[i2++] = lp_sum_r; /* * d->output_scale; */
+		lowpassed[i2++] = lp_sum_j; /* * d->output_scale; */
 		lp_index = 0;
 		lp_sum_r = 0;
 		lp_sum_j = 0;
-		i2 += 2;
 	}
 	d->lp_len = i2;
 	d->lp_index = lp_index;
@@ -230,22 +232,22 @@ void low_pass_real(struct demod_state *s)
 /* simple square window FIR */
 /* add support for upsampling? */
 {
+	int16_t * result = s->result;
+	const int result_len = s->result_len;
 	int i=0, i2=0;
 	int lpr_index = s->lpr_index;
 	int lpr_sum = s->lpr_sum;
-    const int fast = s->rate_out;
+	const int fast = s->rate_out;
 	const int slow = s->rate_out2;
-	while (i < s->result_len) {
-		lpr_sum += s->result[i];
-		i++;
+	while (i < result_len) {
+		lpr_sum += result[i++];
 		lpr_index += slow;
 		if (lpr_index < fast) {
 			continue;
 		}
-		s->result[i2] = (int16_t)(lpr_sum / (fast/slow));
+		result[i2++] = (int16_t)(lpr_sum / (fast/slow));
 		lpr_index -= fast;
 		lpr_sum = 0;
-		i2 += 1;
 	}
 	s->result_len = i2;
 	s->lpr_index = lpr_index;
@@ -294,6 +296,59 @@ void fifth_order(int16_t *data, int length, int16_t *hist)
 	hist[5] = f;
 }
 
+void fifth_order_cx(int16_t *d, int length, int16_t *hist)
+{
+	/* same as fifth_order() - but processes both interleaved I and Q in one call
+	 *   1- idea is, that this improves cpu's memory cache utilization
+	 *   2- get rid of rolling  a,b,c,d,e,f  for every 4 samples
+	 * hist[] needs size 20 !
+	 *
+	 * h[0..9] = already in history
+	 * convolution over 6 coefficients: c[0..5]
+	 *     c0   c1  c2  c3  c4  c5   first convolution requires d[0] - d[1] for imag
+	 *              c0  c1  c2  c3  c4  c5
+	 *                      c0  c1  c2  c3  c4  c5   last convolution requires hist[10] - 11 for imag
+         *                                               last convolution requires d[8] - 9 for imag
+	 *     a    b   c   d   e   d0  d2  d4  d6  d8 |d10  d12
+	 *                          d1  d3  d5  d7  d9 |d11  d13
+	 *                           *       *       *       (*)
+	 *     h0   h2  h4  h6  h8 h10 h12 h14 h16 h18
+	 *     h1   h3  h5  h7  h9 h11 h13 h15 h17 h19
+	 */
+
+	int16_t *p;
+	int i, len;
+
+	assert( length >= 10 && (length % 4) == 0 );
+
+	/* fillup history buffer with begin of data[] */
+	for (i=0; i < 10; ++i)
+		hist[10+i] = d[i];
+
+	/* process samples in history buffer */
+	p = hist;
+	len = 20 - 10;
+	for (i = 0; i < len; i += 4) {	/* i = 0, 4, 8 */
+		/*          = (     a  + (    b  +     e )*5 + (    c +    d )*10 +     f   ) >> 4; */
+		d[i/2  ] = ( p[i+0] + (p[i+2] + p[i+8])*5 + (p[i+4]+p[i+6])*10 + p[i+10] ) >> 4;
+		d[i/2+1] = ( p[i+1] + (p[i+3] + p[i+9])*5 + (p[i+5]+p[i+7])*10 + p[i+11] ) >> 4;
+	}
+
+	/* process new samples from data[] */
+	p = d;
+	len = length - 10;
+	for ( ; i < len; i += 4) {
+		/*          = (     a  + (    b  +     e )*5 + (    c +    d )*10 +     f   ) >> 4; */
+		d[i/2  ] = ( p[i+0] + (p[i+2] + p[i+8])*5 + (p[i+4]+p[i+6])*10 + p[i+10] ) >> 4;
+		d[i/2+1] = ( p[i+1] + (p[i+3] + p[i+9])*5 + (p[i+5]+p[i+7])*10 + p[i+11] ) >> 4;
+	}
+
+	/* save last samples from data[] into hist[] */
+	for (int k = 0; k < 10; ++k)
+		hist[k] = d[i+k];
+}
+
+
 /* 9-tap FIR for interleaved quadrature I/Q data,
  * processes every 2nd sample of data[],
  * thus needs to be called twice.
@@ -341,16 +396,16 @@ static void multiply(int ar, int aj, int br, int bj, int *cr, int *cj)
 	*cj = aj*br + ar*bj;
 }
 
-static int polar_discriminant(int ar, int aj, int br, int bj)
+static int16_t polar_discriminant(int16_t ar, int16_t aj, int16_t br, int16_t bj)
 {
 	int cr, cj;
-	double angle;
+	float angle;
 	multiply(ar, aj, br, -bj, &cr, &cj);
-	angle = atan2((double)cj, (double)cr);
-	return (int)(angle / 3.14159 * (1<<14));
+	angle = atan2f((float)cj, (float)cr);  /* float precision is sufficient */
+	return (int16_t)(angle / 3.14159F * (1<<14));
 }
 
-static int fast_atan2(int y, int x)
+static int16_t fast_atan2(int y, int x)
 /* pre scaled for int16 */
 {
 	int yabs, angle;
@@ -370,10 +425,10 @@ static int fast_atan2(int y, int x)
 	if (y < 0) {
 		return -angle;
 	}
-	return angle;
+	return (int16_t)angle;
 }
 
-static int polar_disc_fast(int ar, int aj, int br, int bj)
+static int16_t polar_disc_fast(int16_t ar, int16_t aj, int16_t br, int16_t bj)
 {
 	int cr, cj;
 	multiply(ar, aj, br, -bj, &cr, &cj);
@@ -382,16 +437,18 @@ static int polar_disc_fast(int ar, int aj, int br, int bj)
 
 int atan_lut_init(void)
 {
-	atan_lut = malloc(atan_lut_size * sizeof(int));
+	if (atan_lut_tab)  /* already initialized? */
+		return 1;
+	atan_lut_tab = malloc(atan_lut_size * sizeof(lut_type));
 
 	for (int i = 0; i < atan_lut_size; i++) {
-		atan_lut[i] = (int) (atan((double) i / (1<<atan_lut_coef)) / 3.14159 * (1<<14));
+		atan_lut_tab[i] = (lut_type) (atan((double) i / (1<<atan_lut_coef)) / 3.14159 * (1<<14));
 	}
 
 	return 0;
 }
 
-static int polar_disc_lut(int ar, int aj, int br, int bj)
+static int16_t polar_disc_lut(int16_t ar, int16_t aj, int16_t br, int16_t bj)
 {
 	int cr, cj, x, x_abs;
 
@@ -421,15 +478,15 @@ static int polar_disc_lut(int ar, int aj, int br, int bj)
 	}
 
 	if (x > 0) {
-		return (cj > 0) ? atan_lut[x] : atan_lut[x] - (1<<14);
+		return (cj > 0) ? atan_lut_tab[x] : atan_lut_tab[x] - (1<<14);
 	} else {
-		return (cj > 0) ? (1<<14) - atan_lut[-x] : -atan_lut[-x];
+		return (cj > 0) ? (1<<14) - atan_lut_tab[-x] : -atan_lut_tab[-x];
 	}
 
 	return 0;
 }
 
-static int esbensen(int ar, int aj, int br, int bj)
+static int16_t esbensen(int ar, int aj, int br, int bj)
 /*
   input signal: s(t) = a*exp(-i*w*t+p)
   a = amplitude, w = angular freq, p = phase difference
@@ -439,44 +496,44 @@ static int esbensen(int ar, int aj, int br, int bj)
   s'*conj(s) / |s|^2 = -i*w
 */
 {
-	int cj, dr, dj;
-	int scaled_pi = 2608; /* 1<<14 / (2*pi) */
-	dr = (br - ar) * 2;
-	dj = (bj - aj) * 2;
-	cj = bj*dr - br*dj; /* imag(ds*conj(s)) */
+	const int scaled_pi = 2608; /* 1<<14 / (2*pi) */
+	int dr = (br - ar) * 2;
+	int dj = (bj - aj) * 2;
+	int cj = bj*dr - br*dj; /* imag(ds*conj(s)) */
 	return (scaled_pi * cj / (ar*ar+aj*aj+1));
 }
 
 void fm_demod(struct demod_state *fm)
 {
 	const int16_t *lp = fm->lowpassed;
-	int pcm = polar_discriminant(lp[0], lp[1],
-		fm->pre_r, fm->pre_j);
-	fm->result[0] = (int16_t)pcm;
-	for (int i = 2; i < (fm->lp_len-1); i += 2) {
-		switch (fm->custom_atan) {
-		case 0:
-			pcm = polar_discriminant(lp[i], lp[i+1],
-				lp[i-2], lp[i-1]);
-			break;
-		case 1:
-			pcm = polar_disc_fast(lp[i], lp[i+1],
-				lp[i-2], lp[i-1]);
-			break;
-		case 2:
-			pcm = polar_disc_lut(lp[i], lp[i+1],
-				lp[i-2], lp[i-1]);
-			break;
-		case 3:
-			pcm = esbensen(lp[i], lp[i+1],
-				lp[i-2], lp[i-1]);
-			break;
-		}
-		fm->result[i/2] = (int16_t)pcm;
+	int16_t *result = fm->result;
+	const int lp_len = fm->lp_len;
+	switch (fm->custom_atan) {
+	default:
+	case 0:
+		result[0] = polar_discriminant(lp[0], lp[1], fm->pre_r, fm->pre_j);
+		for (int i = 2; i < (lp_len-1); i += 2)
+			result[i/2] = polar_discriminant(lp[i], lp[i+1], lp[i-2], lp[i-1]);
+		break;
+	case 1:
+		result[0] = polar_disc_fast(lp[0], lp[1], fm->pre_r, fm->pre_j);
+		for (int i = 2; i < (lp_len-1); i += 2)
+			result[i/2] = polar_disc_fast(lp[i], lp[i+1], lp[i-2], lp[i-1]);
+		break;
+	case 2:
+		result[0] = polar_disc_lut(lp[0], lp[1], fm->pre_r, fm->pre_j);
+		for (int i = 2; i < (lp_len-1); i += 2)
+			result[i/2] = polar_disc_lut(lp[i], lp[i+1], lp[i-2], lp[i-1]);
+		break;
+	case 3:
+		result[0] = esbensen(lp[0], lp[1], fm->pre_r, fm->pre_j);
+		for (int i = 2; i < (lp_len-1); i += 2)
+			result[i/2] = esbensen(lp[i], lp[i+1], lp[i-2], lp[i-1]);
+		break;
 	}
-	fm->pre_r = lp[fm->lp_len - 2];
-	fm->pre_j = lp[fm->lp_len - 1];
-	fm->result_len = fm->lp_len/2;
+	fm->pre_r = lp[lp_len - 2];
+	fm->pre_j = lp[lp_len - 1];
+	fm->result_len = lp_len/2;
 }
 
 void am_demod(struct demod_state *fm)
@@ -710,6 +767,10 @@ void downsample_input(struct demod_state *d)
 {
 	const int ds_p = d->downsample_passes;
 	if (ds_p) {
+		/* this is executed with "rtl_fm -F 9".
+		 * this consumes approx twice the cpu usage (time: user)
+		 *   compared to low_pass() in other branch
+		 */
 		/* this branch might overflow 16 bits!:
 		 *   8 bits from input
 		 * + 3 bits from generic_fir()
@@ -718,8 +779,12 @@ void downsample_input(struct demod_state *d)
 		 * => overflow with more than 5 stages!
 		 */
 		for (int i=0; i < ds_p; i++) {
+#if 1
 			fifth_order(d->lowpassed,   (d->lp_len >> i), d->lp_i_hist[i]);
 			fifth_order(d->lowpassed+1, (d->lp_len >> i) - 1, d->lp_q_hist[i]);
+#else
+			fifth_order_cx(d->lowpassed, (d->lp_len >> i), d->lp_iq_hist[i]);
+#endif
 		}
 		d->lp_len = d->lp_len >> ds_p;
 		/* droop compensation */
@@ -730,6 +795,7 @@ void downsample_input(struct demod_state *d)
 				cic_9_tables[ds_p], d->droop_q_hist);
 		}
 	} else {
+		/* default */
 		low_pass(d);
 	}
 }
