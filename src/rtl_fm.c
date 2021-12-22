@@ -175,7 +175,6 @@ struct output_state
 
 struct controller_state
 {
-	int	  exit_flag;
 	pthread_t thread;
 	uint32_t freqs[FREQUENCIES_LIMIT];
 	int	  freq_len;
