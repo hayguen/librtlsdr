@@ -53,6 +53,7 @@
 #include <libusb.h>
 
 #include <sys/sysinfo.h>
+#include <stdatomic.h>
 
 #include <rtl-sdr.h>
 #include <rtl_app_ver.h>
@@ -67,6 +68,8 @@
 
 #define MAX_NUM_CHANNELS  32
 #define RING_COUNT        4
+
+#define ONE_SEC_TO_USEC 1000.0
 
 static int BufferDump = DEFAULT_BUFFER_DUMP;
 static int OutputToStdout = 1;
@@ -91,18 +94,24 @@ char * aCritStr[] = { "in", "out", "<", ">" };
 time_t stop_time;
 int duration = 0;
 
+typedef struct I_FILE {
+   FILE *f;
+   char *name;
+} I_FILE;
+
 struct multi_demod_state
 {
-	struct demod_state *config_demod_states; //its just for keeping configs
+	struct demod_state *config_demod_state; //its just for keeping configs
 	struct demod_state demod_states[MAX_NUM_CHANNELS];
 	pthread_t thread;
 	int channel_count;
 	int16_t  lowpassed[RING_COUNT][MAXIMUM_BUF_LENGTH];
+	atomic_int  ring_buffer_free[RING_COUNT];
 	int      lp_len;
 	int      r_ring_index;
 	int      w_ring_index;
-	FILE     *fptr[MAX_NUM_CHANNELS];
-    FILE     *mpx_fptr[MAX_NUM_CHANNELS];
+	I_FILE     *fptr[MAX_NUM_CHANNELS];
+    I_FILE     *mpx_fptr[MAX_NUM_CHANNELS];
 	uint32_t freqs[MAX_NUM_CHANNELS];
 	int	  freq_len;
 	int	  exit_flag;
@@ -295,6 +304,9 @@ static double log2(double n)
 }
 #endif
 
+int min(int a, int b) {
+	return (a > b) ? b : a;
+}
 
 static char * trim(char * s) {
 	char *p = s;
@@ -551,11 +563,40 @@ static void checkTriggerCommand(struct cmd_state *c, unsigned char adcSampleMax,
 	c->numSummed++;
 }
 
+char * generate_iq_file_name(char* filename) {
 
-void full_demod(struct demod_state *d)
+	struct timeval timestamp;
+    time_t current_time;
+	struct tm *tm;
+	char *new_file_name;
+	size_t filename_size;
+	char delim[] = "_";
+	char *ptr = strtok(filename, delim);
+
+    current_time = time(NULL);
+    tm = localtime(&current_time);
+	gettimeofday(&timestamp, NULL);
+	new_file_name = (char *) malloc(100 * sizeof(char));
+	filename_size = sizeof(new_file_name);
+    memset(new_file_name, 0, filename_size);
+    sprintf(new_file_name, "%s_%02d-%02d-%d_%02d:%02d:%02d_%03ld.raw", ptr, tm->tm_mday, tm->tm_mon+1, tm->tm_year+1900, tm->tm_hour, tm->tm_min, tm->tm_sec, timestamp.tv_usec%1000);
+	return new_file_name;
+}
+
+I_FILE * create_iq_file(I_FILE* fptr, const char* filename) {
+    fptr->f = fopen(filename, "w");
+    if(fptr->f == NULL){return NULL;}
+	
+	fptr->name = strdup(filename);
+            
+    fprintf(stdout, "new file created with name %s\n", filename);
+    return fptr;
+}
+
+void full_demod(struct demod_state *d, int16_t *lowpassed, int sub_len)
 {
 	struct cmd_state *c = dm_thr.cmd;//??????????????????????????????????????????????????????????????????????????????
-	//struct demod_state *d = &dt->demod;
+	//struct demod_state *d = &mds->demod;
 	double freqK, avgRms, rmsLevel, avgRmsLevel;
 	int sr = 0;
 	static int printBlockLen = 1;
@@ -564,12 +605,12 @@ void full_demod(struct demod_state *d)
 
 	/* power squelch */
 	if (d->squelch_level) {
-		sr = rms(d->lowpassed, d->lp_len, 1, d->omit_dc_fix);
+		sr = rms(lowpassed, d->lp_len, 1, d->omit_dc_fix);
 		if (sr >= 0) {
 			if (sr < d->squelch_level) {
 				d->squelch_hits++;
 				for (int i=0; i<d->lp_len; i++) {
-					d->lowpassed[i] = 0;
+					lowpassed[i] = 0;
 				}
 			} else {
 				d->squelch_hits = 0;}
@@ -578,7 +619,7 @@ void full_demod(struct demod_state *d)
 
 	if (printLevels) {
 		if (!sr)
-			sr = rms(d->lowpassed, d->lp_len, 1, d->omit_dc_fix);
+			sr = rms(lowpassed, d->lp_len, 1, d->omit_dc_fix);
 		--printLevelNo;
 		if (printLevels && sr >= 0) {
 			levelSum += sr;
@@ -600,7 +641,7 @@ void full_demod(struct demod_state *d)
 
 	if (c->filename) {
 		if (!sr)
-			sr = rms(d->lowpassed, d->lp_len, 1, d->omit_dc_fix);
+			sr = rms(lowpassed, d->lp_len, 1, d->omit_dc_fix);
 		if ( printBlockLen && verbosity ) {
 			fprintf(stderr, "block length for rms after decimation is %d samples\n", d->lp_len);
 			if ( d->lp_len < 128 )
@@ -615,10 +656,15 @@ void full_demod(struct demod_state *d)
 		}
 	}
 
+	memcpy(d->lowpassed, lowpassed, sub_len); // ?? how to pass memcpy?
 	d->mode_demod(d);  /* lowpassed -> result */
 	if (d->mode_demod == &raw_demod) {
 		return;
 	}
+
+	memcpy(d->result_mpx, d->result, d->result_len);
+	d->result_mpx_len = d->result_len;
+
 	/* todo, fm noise squelch */
 	/* use nicer filter here too? */
 	if (d->post_downsample > 1) {
@@ -636,13 +682,14 @@ void full_demod(struct demod_state *d)
 static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 {
 	struct dongle_state *s = ctx;
-	struct demod_thread_state *dt = s->demod_target;
-	struct cmd_state *c = dt->cmd;
+	struct multi_demod_state *mds = s->demod_target;
+	struct cmd_state *c = mds->cmd;
 	int i, muteLen = s->mute;
 	unsigned char sampleMax;
 	uint32_t sampleP, samplePowSum = 0.0;
 	int samplePowCount = 0, step = 2;
 	time_t rawtime;
+	int16_t *target;
 
 	if (do_exit) {
 		return;}
@@ -690,26 +737,31 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 		s->samplePowSum += (double)samplePowSum / samplePowCount;
 		s->samplePowCount += 1;
 	}
+
+	mds->w_ring_index++;
+	mds->w_ring_index %= 4;
+    target = mds->lowpassed[mds->w_ring_index];
+
 	/* 1st: convert to 16 bit - to allow easier calculation of DC */
 	for (i=0; i<(int)len; i++) {
-		s->buf16[i] = ( (int16_t)buf[i] - 127 );
+		target[i] = ( (int16_t)buf[i] - 127 );
 	}
 	/* 2nd: do DC filtering BEFORE up-mixing */
 	if (s->dc_block_raw) {
-		dc_block_raw_filter(s->buf16, (int)len, s->rdc_avg, s->rdc_block_const);
+		dc_block_raw_filter(target, (int)len, s->rdc_avg, s->rdc_block_const);
 	}
 	if (muteLen && c->filename)
 		return;	/* "mute" after the dc_block_raw_filter(), giving it time to remove the new DC */
 	/* 3rd: down-mixing */
-	//if (!s->offset_tuning) { //fixme ?? offset tuning kalktı duracak mı?
-	rotate16_neg90(s->buf16, (int)len);
+	//if (!s->offset_tuning) { //fixme ?? offset tuning kalktı, rotate16_neg90 duracak mı?
+	rotate16_neg90(target, (int)len);
 	//}
 
-	pthread_rwlock_wrlock(&dt->rw);
-	memcpy(dt->demod.lowpassed, s->buf16, 2*len);
-	dt->demod.lp_len = len;
-	pthread_rwlock_unlock(&dt->rw);
-	safe_cond_signal(&dt->ready, &dt->ready_m);
+	memcpy(mds->lowpassed[mds->r_ring_index], target, len*2);
+	mds->lp_len = len;
+	pthread_rwlock_wrlock(&mds->rw);
+	pthread_rwlock_unlock(&mds->rw);
+	safe_cond_signal(&mds->ready, &mds->ready_m);
 }
 
 static void *dongle_thread_fn(void *arg)
@@ -719,64 +771,82 @@ static void *dongle_thread_fn(void *arg)
 	return 0;
 }
 
-static void *demod_thread_fn(void *arg)
+static void *multi_demod_thread_fn(void *arg)
 {
-	struct demod_thread_state *dt = arg;
-	struct demod_state *d = &dt->demod;
-	struct output_state *o = dt->output_target;
-	struct cmd_state *c = dt->cmd;
-	while (!do_exit) {
-		safe_cond_wait(&dt->ready, &dt->ready_m);
-		pthread_rwlock_wrlock(&dt->rw);
-		full_demod(dt);
-		pthread_rwlock_unlock(&dt->rw);
+	struct multi_demod_state *mds = arg;
+	struct cmd_state *c = mds->cmd;
+	int16_t *source;
 
-		if (d->squelch_level && d->squelch_hits > d->conseq_squelch) {
-			d->squelch_hits = d->conseq_squelch + 1;  /* hair trigger */
-			safe_cond_signal(&controller.hop, &controller.hop_m);
-			continue;
+	struct timeval t1, t2;
+	struct timeval timestamp;
+	time_t current_time = time(NULL);
+	struct tm *tm = localtime(&current_time);
+	double diff, diff_file;
+
+	gettimeofday(&t1, NULL);
+	while (!do_exit) {
+		
+		gettimeofday(&t2, NULL);
+		diff = (t2.tv_sec - t1.tv_sec) * 1000.0;
+		diff += (t2.tv_usec - t1.tv_usec) / 1000.0;
+
+		if (diff > ONE_SEC_TO_USEC * mds->split_duration) { 
+			
+			current_time = time(NULL);
+            tm = localtime(&current_time);
+			
+			for (int demod_idx=0; demod_idx<mds->channel_count; ++demod_idx) {
+				char* recording_file_name;
+				current_time = time(NULL);
+				tm = localtime(&current_time);
+
+				recording_file_name = generate_iq_file_name(mds->fptr[demod_idx]->name);
+				fclose(mds->fptr[demod_idx]->f);
+				free(mds->fptr[demod_idx]->name);
+				mds->fptr[demod_idx] = create_iq_file(mds->fptr[demod_idx], recording_file_name);
+				recording_file_name = NULL;
+
+				recording_file_name = generate_iq_file_name(mds->mpx_fptr[demod_idx]->name);
+				fclose(mds->mpx_fptr[demod_idx]->f);
+				free(mds->mpx_fptr[demod_idx]->name);
+				mds->mpx_fptr[demod_idx] = create_iq_file(mds->mpx_fptr[demod_idx], recording_file_name);
+
+				gettimeofday(&t1, NULL);
+				free((void *)recording_file_name);
+			}
 		}
+
+		safe_cond_wait(&mds->ready, &mds->ready_m);
+		pthread_rwlock_wrlock(&mds->rw);
+
+		source = mds->lowpassed[mds->r_ring_index];
+		mds->r_ring_index++;
+		mds->r_ring_index %= 4;
+
+		for (int offset=0; offset < mds->lp_len; offset += 2048){
+			int sub_len = min(2048, mds->lp_len-offset);
+			for (int demod_idx=0; demod_idx<mds->channel_count; ++demod_idx) {
+				struct demod_state *d = &mds->demod_states[demod_idx];
+				int16_t *lowpassed = &source[offset];
+				//mixer(demod_idx)
+				d->lp_len = sub_len;
+				full_demod(d, lowpassed, d->lp_len);
+				fwrite(d->result, 2, d->result_len, mds->fptr[demod_idx]->f); //ffmpeg //bunları pipe yapmaya çalış.
+
+				//3 4 sn lik olarak yolla.
+				fwrite(d->result_mpx, 2, d->result_mpx_len, mds->mpx_fptr[demod_idx]->f); //redsea
+			}
+		}
+
+
+		pthread_rwlock_unlock(&mds->rw);
 
 		if (do_exit)
 			break;
 
 		if (c->filename && c->numSummed >= c->numMeas) {
 			checkTriggerCommand(c, dongle.sampleMax, dongle.samplePowSum, dongle.samplePowCount);
-
-			safe_cond_signal(&controller.hop, &controller.hop_m);
 			continue;
-		}
-
-		if (OutputToStdout) {
-			pthread_rwlock_wrlock(&o->rw);
-			memcpy(o->result, d->result, 2*d->result_len);
-			o->result_len = d->result_len;
-			pthread_rwlock_unlock(&o->rw);
-			safe_cond_signal(&o->ready, &o->ready_m);
-		}
-	}
-	return 0;
-}
-
-static void *output_thread_fn(void *arg)
-{
-	struct output_state *s = arg;
-	if (!waveHdrStarted) {
-		while (!do_exit) {
-			/* use timedwait and pad out under runs */
-			safe_cond_wait(&s->ready, &s->ready_m);
-			pthread_rwlock_rdlock(&s->rw);
-			fwrite(s->result, 2, s->result_len, s->file);
-			pthread_rwlock_unlock(&s->rw);
-		}
-	} else {
-		while (!do_exit) {
-			/* use timedwait and pad out under runs */
-			safe_cond_wait(&s->ready, &s->ready_m);
-			pthread_rwlock_rdlock(&s->rw);
-			/* distinguish for endianness: wave requires little endian */
-			waveWriteSamples(s->file, s->result, s->result_len, 0);
-			pthread_rwlock_unlock(&s->rw);
 		}
 	}
 	return 0;
@@ -790,8 +860,8 @@ static void *output_thread_fn(void *arg)
 // 	uint64_t capture_freq;
 // 	uint32_t capture_rate;
 // 	struct dongle_state *d = &dongle;
-// 	struct demod_thread_state *dt = &dm_thr;
-// 	struct demod_state *dm = &dt->demod;
+// 	struct demod_thread_state *mds = &dm_thr;
+// 	struct demod_state *dm = &mds->demod;
 // 	struct controller_state *cs = &controller;
 // 	dm->downsample = (MinCaptureRate / dm->rate_in) + 1;
 // 	if (dm->downsample_passes) {
@@ -838,7 +908,7 @@ static void *controller_fn(void *arg)
 	int32_t if_band_center_freq = 0;
 	struct multi_demod_state *s = arg;
 	struct cmd_state *c = s->cmd;
-	struct demod_state *demod = dm_thr.config_demod_states;
+	struct demod_state *demod = dm_thr.config_demod_state;
 
 	if (s->wb_mode) {
 		if (verbosity)
@@ -941,7 +1011,7 @@ void dongle_init(struct dongle_state *s)
 }
 
 void init_demods() {
-	struct demod_state *conf = dm_thr.config_demod_states; 
+	struct demod_state *conf = dm_thr.config_demod_state; 
 	for(int i=0; i<dm_thr.channel_count; i++) {
 		struct demod_state *s = &dm_thr.demod_states[i];
 		s->comp_fir_size = conf->comp_fir_size;
@@ -974,11 +1044,12 @@ void init_demods() {
 	}
 }
 
-void multi_demod_thread_init(struct multi_demod_state *s, struct cmd_state *cmd)
+void multi_demod_state_init(struct multi_demod_state *s, struct cmd_state *cmd)
 {
 	char *file_name;
-
-	demod_init(s->config_demod_states); //just for config arranging
+	
+	s->config_demod_state = (struct demod_state *)malloc(sizeof(struct demod_state));
+	demod_init(s->config_demod_state); //just for config arranging
 
 	s->channel_count = get_nprocs()-2;
 	printf("This system has %d processors configured and "
@@ -987,20 +1058,27 @@ void multi_demod_thread_init(struct multi_demod_state *s, struct cmd_state *cmd)
 	s->r_ring_index = 0;
 	s->w_ring_index = 0;
 	s->split_duration = 60;
+	for (int i = 0; i < RING_COUNT; i++)
+	{
+		s->ring_buffer_free[i] = 1;
+	}
+	
 	pthread_rwlock_init(&s->rw, NULL);
 	pthread_cond_init(&s->ready, NULL);
 	pthread_mutex_init(&s->ready_m, NULL);
-	file_name = (char *) malloc(100 * sizeof(char));
-	memset(file_name, 0, 100);
+	file_name = (char *) malloc(50 * sizeof(char));
+	memset(file_name, 0, 50);
 	for(int i=0; i<s->channel_count; i++) {
-	    sprintf(file_name, "%d.wav", i);
-		s->fptr[i] = fopen(file_name, "wb");
-		
-    	sprintf(file_name, "%d_mpx.wav", i);
-		s->mpx_fptr[i] = fopen(file_name, "wb");
+		s->fptr[i] = (I_FILE *) malloc(sizeof(I_FILE));
+		s->mpx_fptr[i] = (I_FILE *) malloc(sizeof(I_FILE));
+	    sprintf(file_name, "%d", i);
+		s->fptr[i]->f = fopen(generate_iq_file_name(file_name), "wb");
+		s->fptr[i]->name = strdup(file_name);
+				
+    	sprintf(file_name, "%d-mpx", i);
+		s->mpx_fptr[i]->f = fopen(generate_iq_file_name(file_name), "wb");
+		s->mpx_fptr[i]->name = strdup(file_name);
 
-		if(&s->demod_states[i])
-			exit(0);
 	}
 	free(file_name);
 
@@ -1047,13 +1125,14 @@ int main(int argc, char **argv)
 	int custom_ppm = 0;
 	int enable_biastee = 0;
 	const char * rtlOpts = NULL;
+	struct demod_state *demod = NULL;
 	enum rtlsdr_ds_mode ds_mode = RTLSDR_DS_IQ;
 	uint32_t ds_temp, ds_threshold = 0;
 	int timeConstant = 75; /* default: U.S. 75 uS */
 	int rtlagc = 0;
-	struct demod_state *demod = dm_thr.config_demod_states;
 	dongle_init(&dongle);
-	multi_demod_thread_init(&dm_thr, &cmd);
+	multi_demod_state_init(&dm_thr, &cmd);
+	demod = dm_thr.config_demod_state;
 	cmd_init(&cmd);
 
 	while ((opt = getopt(argc, argv, "d:f:g:s:b:o:r:t:p:R:E:O:F:A:M:hTC:B:m:L:q:c:w:W:D:nHv")) != -1) {
@@ -1310,7 +1389,7 @@ int main(int argc, char **argv)
 
 	controller_fn(&dm_thr);
 	usleep(1000000); /* it looks, that startup of dongle level takes some time at startup! */
-	pthread_create(&dm_thr.thread, NULL, demod_thread_fn, (void *)(&dm_thr));
+	pthread_create(&dm_thr.thread, NULL, multi_demod_thread_fn, (void *)(&dm_thr));
 	pthread_create(&dongle.thread, NULL, dongle_thread_fn, (void *)(&dongle));
 
 	while (!do_exit) {

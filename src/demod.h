@@ -42,8 +42,10 @@ struct demod_state
 {
 	int16_t   lowpassed[MAXIMUM_BUF_LENGTH];	/* input and decimated quadrature I/Q sample-pairs */
 	int16_t   result[MAXIMUM_BUF_LENGTH];		/* demodulated inphase signal */
+	int16_t   result_mpx[MAXIMUM_BUF_LENGTH];		/* mpx signal */
 	int	  lp_len;		/* number of valid quadrature I/Q sample-pairs in lowpassed[] */
 	int	  result_len;		/* number of valid samples in result[] */
+	int	  result_mpx_len;		/* number of valid samples in result_mpx[] */
 
 	int16_t   lp_i_hist[MAXIMUM_DOWNSAMPLE_PASSES][6];
 	int16_t   lp_q_hist[MAXIMUM_DOWNSAMPLE_PASSES][6];
