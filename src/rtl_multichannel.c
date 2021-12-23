@@ -87,7 +87,6 @@ static int levelMaxMax = 0;
 static double levelSum = 0.0;
 static int32_t prev_if_band_center_freq = 0;
 
-
 enum trigExpr { crit_IN =0, crit_OUT, crit_LT, crit_GT };
 char * aCritStr[] = { "in", "out", "<", ">" };
 
@@ -112,6 +111,8 @@ struct multi_demod_state
 	int      w_ring_index;
 	I_FILE     *fptr[MAX_NUM_CHANNELS];
     I_FILE     *mpx_fptr[MAX_NUM_CHANNELS];
+	char *ffmpeg_command;
+	char *redsea_command;
 	uint32_t freqs[MAX_NUM_CHANNELS];
 	int	  freq_len;
 	int	  exit_flag;
@@ -563,6 +564,28 @@ static void checkTriggerCommand(struct cmd_state *c, unsigned char adcSampleMax,
 	c->numSummed++;
 }
 
+I_FILE* open_ffmpeg_pipe(char *file_name, int demod_id, char* command){
+	I_FILE *ptr = (struct I_FILE*)malloc(sizeof(struct I_FILE*));
+	sprintf(file_name, "%d", demod_id);
+	strcat(command, " ");
+	strcat(command, file_name);
+	//strcat(ffmpeg_command, " > /dev/null");
+	ptr->f = popen(command, "w");
+	ptr->name = strdup(file_name);
+	return ptr;
+}
+
+I_FILE* open_redsea_pipe(char *file_name, int demod_id, char* command){
+	I_FILE *ptr = (struct I_FILE*)malloc(sizeof(struct I_FILE*));
+	sprintf(file_name, "%d-mpx", demod_id);
+	strcat(command, " ");
+	strcat(command, file_name);
+	//strcat(redsea_command, " > /dev/null");
+	ptr->f = popen(command, "w");
+	ptr->name = strdup(file_name);
+	return ptr;
+}
+
 char * generate_iq_file_name(char* filename) {
 
 	struct timeval timestamp;
@@ -800,17 +823,27 @@ static void *multi_demod_thread_fn(void *arg)
 				current_time = time(NULL);
 				tm = localtime(&current_time);
 
-				recording_file_name = generate_iq_file_name(mds->fptr[demod_idx]->name);
-				fclose(mds->fptr[demod_idx]->f);
-				free(mds->fptr[demod_idx]->name);
-				mds->fptr[demod_idx] = create_iq_file(mds->fptr[demod_idx], recording_file_name);
-				recording_file_name = NULL;
+				if (strlen(mds->ffmpeg_command) == 0 || strlen(mds->redsea_command) == 0) {
+					recording_file_name = generate_iq_file_name(mds->fptr[demod_idx]->name);
+					fclose(mds->fptr[demod_idx]->f);
+					free(mds->fptr[demod_idx]->name);
+					mds->fptr[demod_idx] = create_iq_file(mds->fptr[demod_idx], recording_file_name);
 
-				recording_file_name = generate_iq_file_name(mds->mpx_fptr[demod_idx]->name);
-				fclose(mds->mpx_fptr[demod_idx]->f);
-				free(mds->mpx_fptr[demod_idx]->name);
-				mds->mpx_fptr[demod_idx] = create_iq_file(mds->mpx_fptr[demod_idx], recording_file_name);
+					recording_file_name = generate_iq_file_name(mds->mpx_fptr[demod_idx]->name);
+					fclose(mds->mpx_fptr[demod_idx]->f);
+					free(mds->mpx_fptr[demod_idx]->name);
+					mds->mpx_fptr[demod_idx] = create_iq_file(mds->mpx_fptr[demod_idx], recording_file_name);
+				} else {
+					recording_file_name = generate_iq_file_name(mds->fptr[demod_idx]->name);
+					pclose(mds->fptr[demod_idx]->f);
+					free(mds->fptr[demod_idx]->name);
+					mds->fptr[demod_idx] = open_ffmpeg_pipe(recording_file_name, demod_idx, mds->ffmpeg_command);
 
+					recording_file_name = generate_iq_file_name(mds->mpx_fptr[demod_idx]->name);
+					pclose(mds->mpx_fptr[demod_idx]->f);
+					free(mds->mpx_fptr[demod_idx]->name);
+					mds->mpx_fptr[demod_idx] = open_redsea_pipe(recording_file_name, demod_idx, mds->redsea_command);
+				}
 				gettimeofday(&t1, NULL);
 				free((void *)recording_file_name);
 			}
@@ -1046,7 +1079,6 @@ void init_demods() {
 
 void multi_demod_state_init(struct multi_demod_state *s, struct cmd_state *cmd)
 {
-	char *file_name;
 	
 	s->config_demod_state = (struct demod_state *)malloc(sizeof(struct demod_state));
 	demod_init(s->config_demod_state); //just for config arranging
@@ -1062,30 +1094,41 @@ void multi_demod_state_init(struct multi_demod_state *s, struct cmd_state *cmd)
 	{
 		s->ring_buffer_free[i] = 1;
 	}
+	s->redsea_command = "";
+	s->ffmpeg_command = "";
+	pthread_rwlock_init(&s->rw, NULL);
+	pthread_cond_init(&s->ready, NULL);
+	pthread_mutex_init(&s->ready_m, NULL);
 	
 	pthread_rwlock_init(&s->rw, NULL);
 	pthread_cond_init(&s->ready, NULL);
 	pthread_mutex_init(&s->ready_m, NULL);
+	s->cmd = cmd;
+}
+
+void multi_demod_init_fptrs(struct multi_demod_state *s, char* redsea_command, char* ffmpeg_command){
+	char *file_name;
 	file_name = (char *) malloc(50 * sizeof(char));
 	memset(file_name, 0, 50);
+
 	for(int i=0; i<s->channel_count; i++) {
 		s->fptr[i] = (I_FILE *) malloc(sizeof(I_FILE));
 		s->mpx_fptr[i] = (I_FILE *) malloc(sizeof(I_FILE));
 	    sprintf(file_name, "%d", i);
-		s->fptr[i]->f = fopen(generate_iq_file_name(file_name), "wb");
-		s->fptr[i]->name = strdup(file_name);
-				
-    	sprintf(file_name, "%d-mpx", i);
-		s->mpx_fptr[i]->f = fopen(generate_iq_file_name(file_name), "wb");
-		s->mpx_fptr[i]->name = strdup(file_name);
 
-	}
+		if (strlen(dm_thr.ffmpeg_command) != 0 && strlen(dm_thr.redsea_command) != 0) {
+			s->fptr[i] = open_ffmpeg_pipe(file_name, i, ffmpeg_command);
+			sprintf(file_name, "%d-mpx", i);
+			s->mpx_fptr[i] = open_redsea_pipe(file_name, i, redsea_command);
+		} else {
+			s->fptr[i]->f = fopen(generate_iq_file_name(file_name), "wb");
+			s->fptr[i]->name = strdup(file_name);
+			sprintf(file_name, "%d-mpx", i);
+			s->mpx_fptr[i]->f = fopen(generate_iq_file_name(file_name), "wb");
+			s->mpx_fptr[i]->name = strdup(file_name);
+		}
+    }
 	free(file_name);
-
-	pthread_rwlock_init(&s->rw, NULL);
-	pthread_cond_init(&s->ready, NULL);
-	pthread_mutex_init(&s->ready_m, NULL);
-	s->cmd = cmd;
 }
 
 void demod_thread_cleanup(struct multi_demod_state *s)
@@ -1135,7 +1178,7 @@ int main(int argc, char **argv)
 	demod = dm_thr.config_demod_state;
 	cmd_init(&cmd);
 
-	while ((opt = getopt(argc, argv, "d:f:g:s:b:o:r:t:p:R:E:O:F:A:M:hTC:B:m:L:q:c:w:W:D:nHv")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:g:s:b:o:a:x:r:t:p:R:E:O:F:A:M:hTC:B:m:L:q:c:w:W:D:nHv")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
@@ -1218,6 +1261,12 @@ int main(int argc, char **argv)
 		case 'q':
 			dongle.rdc_block_const = atoi(optarg);
 			break;
+		case 'a':
+			dm_thr.ffmpeg_command = optarg;
+			break;
+		case 'x':
+			dm_thr.redsea_command = optarg;
+			break;
 		case 'F':
 			demod->downsample_passes = 1;  /* truthy placeholder */
 			demod->comp_fir_size = atoi(optarg);
@@ -1295,6 +1344,7 @@ int main(int argc, char **argv)
 		}
 	}
 
+	multi_demod_init_fptrs(&dm_thr, dm_thr.redsea_command, dm_thr.ffmpeg_command);
 	init_demods();
 
 	if (verbosity)

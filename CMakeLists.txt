@@ -41,6 +41,8 @@ if(NOT LIB_INSTALL_DIR)
    set(LIB_INSTALL_DIR lib)
 endif()
 
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g3")
+
 OPTION(LINK_RTLTOOLS_AGAINST_STATIC_LIB "Link rtl-tools statically against librtlsdr" OFF)
 
 OPTION(PROVIDE_UDP_SERVER "Provide UDP server for tests" OFF)

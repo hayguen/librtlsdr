@@ -38,17 +38,30 @@
 #define MAXIMUM_DOWNSAMPLE_PASSES      10
 
 
+struct mixer_state
+{
+	int16_t   inv_sqrt[16];   /* precalculated inverse square root() */
+	int16_t   mix[16][2];	  /* out[i] = inp[i] * mix[(i-1) % 16] * rot */
+	int16_t   rot[2];         /* complex rotation multiplicator: mix[k] = mix[k-1] * rot[0] */
+	int	  index;          /* next index to use of mix[] */
+	int	  skip;           /* can skip mixing? - cause frequency is 0 */
+};
+
 struct demod_state
 {
 	int16_t   lowpassed[MAXIMUM_BUF_LENGTH];	/* input and decimated quadrature I/Q sample-pairs */
 	int16_t   result[MAXIMUM_BUF_LENGTH];		/* demodulated inphase signal */
-	int16_t   result_mpx[MAXIMUM_BUF_LENGTH];		/* mpx signal */
-	int	  lp_len;		/* number of valid quadrature I/Q sample-pairs in lowpassed[] */
+	int16_t   result_mpx[MAXIMUM_BUF_LENGTH];		/* demodulated inphase signal */
+	int	  lp_len;		/* number of valid samples in lowpassed[] - NOT quadrature I/Q sample-pairs! */
 	int	  result_len;		/* number of valid samples in result[] */
-	int	  result_mpx_len;		/* number of valid samples in result_mpx[] */
+	int	  result_mpx_len;		/* number of valid samples in result[] */
 
+#if 1
 	int16_t   lp_i_hist[MAXIMUM_DOWNSAMPLE_PASSES][6];
 	int16_t   lp_q_hist[MAXIMUM_DOWNSAMPLE_PASSES][6];
+#else
+	int16_t   lp_iq_hist[MAXIMUM_DOWNSAMPLE_PASSES][20+4];	/* 20 would be sufficient - but fill cache-line */
+#endif
 
 	int16_t   droop_i_hist[9];
 	int16_t   droop_q_hist[9];
@@ -91,6 +104,10 @@ struct demod_state
 };
 
 void demod_init(struct demod_state *s);
+
+void mixer_init(struct mixer_state *mixer, double rel_freq, double samplerate);
+void mixer_apply(struct mixer_state *mixer, int len, const int16_t *inp, int16_t *out);
+
 
 void rotate16_neg90(int16_t *buf, uint32_t len);
 
