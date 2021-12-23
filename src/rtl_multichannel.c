@@ -85,6 +85,7 @@ struct demod_thread_state
 	pthread_mutex_t	ready_m;
 	struct output_state	*output_target;
 
+	struct mixer_state mixer;
 	struct demod_state demod;
 };
 
@@ -93,22 +94,16 @@ struct dongle_state
 	pthread_t thread;
 	rtlsdr_dev_t *dev;
 	int	  dev_index;
-	uint64_t userFreq;
 	uint64_t freq;
 	uint32_t rate;
 	uint32_t bandwidth;
-	int	  bccorner;  /* -1 for low band corner, 0 for band center, +1 for high band corner */
 	int	  gain;
 	int16_t  buf16[MAXIMUM_BUF_LENGTH];
 	uint32_t buf_len;
 	int	  ppm_error;
-	int	  offset_tuning;
 	int	  direct_sampling;
 	int	  mute;
 	struct demod_thread_state *demod_target;
-	double samplePowSum;
-	int samplePowCount;
-	unsigned char sampleMax;
 
 	int	  dc_block_raw;	/* flag: activate dc_block_raw_filter() */
 	int	  rdc_avg[2];		/* state for dc_block_raw_filter() */
@@ -129,9 +124,7 @@ struct controller_state
 {
 	uint32_t freqs[FREQUENCIES_LIMIT];
 	int	  freq_len;
-	int	  freq_now;
-	int	  edge;
-	int	  wb_mode;
+	uint32_t  center_freq;
 };
 
 /* multiple of these, eventually */
@@ -175,18 +168,11 @@ void usage(void)
 		"\t[-R run_seconds] specify number of seconds to run\n"
 		"\t[-E enable_option (default: none)]\n"
 		"\t	use multiple -E to enable multiple options\n"
-		"\t	edge:   enable lower edge tuning\n"
 		"\t	rdc:    enable dc blocking filter on raw I/Q data at capture rate\n"
 		"\t	adc:    enable dc blocking filter on demodulated audio\n"
-		"\t	dc:     same as adc\n"
 		"\t	rtlagc: enable rtl2832's digital agc (default: off)\n"
-		"\t	agc:    same as rtlagc\n"
 		"\t	deemp:  enable de-emphasis filter\n"
 		"\t	direct: enable direct sampling (bypasses tuner, uses rtl2832 xtal)\n"
-		"\t	offset: enable offset tuning (only e4000 tuner)\n"
-		"\t	bcc:    use tuner bandwidths center as band center (default)\n"
-		"\t	bclo:   use tuner bandwidths low  corner as band center\n"
-		"\t	bchi:   use tuner bandwidths high corner as band center\n"
 		"%s"
 		"\t[-q dc_avg_factor for option rdc (default: 9)]\n"
 		"\t[-H write wave Header to file (default: off)]\n"
@@ -241,17 +227,6 @@ static double log2(double n)
 #endif
 
 
-static char * trim(char * s) {
-	char *p = s;
-	int l = strlen(p);
-
-	while(isspace(p[l - 1])) p[--l] = 0;
-	while(*p && isspace(*p)) ++p;
-
-	return p;
-}
-
-
 void full_demod(struct demod_thread_state *dt)
 {
 	struct demod_state *d = &dt->demod;
@@ -277,10 +252,7 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 {
 	struct dongle_state *s = ctx;
 	struct demod_thread_state *dt = s->demod_target;
-	int i, muteLen = s->mute;
-	unsigned char sampleMax;
-	uint32_t sampleP, samplePowSum = 0.0;
-	int samplePowCount = 0, step = 2;
+	int i;
 	time_t rawtime;
 
 	if (do_exit) {
@@ -304,10 +276,6 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 	if (s->dc_block_raw) {
 		dc_block_raw_filter(s->buf16, (int)len, s->rdc_avg, s->rdc_block_const);
 	}
-	/* 3rd: down-mixing */
-	if (!s->offset_tuning) {
-		rotate16_neg90(s->buf16, (int)len);
-	}
 
 	pthread_rwlock_wrlock(&dt->rw);
 	memcpy(dt->demod.lowpassed, s->buf16, 2*len);
@@ -327,9 +295,12 @@ static void *demod_thread_fn(void *arg)
 {
 	struct demod_thread_state *dt = arg;
 	struct demod_state *d = &dt->demod;
+	struct output_state *o = &output;
 	while (!do_exit) {
 		safe_cond_wait(&dt->ready, &dt->ready_m);
 		pthread_rwlock_wrlock(&dt->rw);
+		/* todo: apply mixer per channel */
+		mixer_apply(&dt->mixer, d->lp_len, d->lowpassed, d->lowpassed);
 		full_demod(dt);
 		pthread_rwlock_unlock(&dt->rw);
 
@@ -340,6 +311,11 @@ static void *demod_thread_fn(void *arg)
 		memcpy(o->result, d->result, 2*d->result_len);
 		o->result_len = d->result_len;
 		*/
+
+		if (!waveHdrStarted)
+			fwrite(d->result, 2, d->result_len, o->file);
+		else
+			waveWriteSamples(o->file, d->result, d->result_len, 0);
 	}
 	return 0;
 }
@@ -367,7 +343,6 @@ static void optimal_settings(uint64_t freq, uint32_t rate)
 	/* giant ball of hacks
 	 * seems unable to do a single pass, 2:1
 	 */
-	uint64_t capture_freq;
 	uint32_t capture_rate;
 	struct dongle_state *d = &dongle;
 	struct demod_thread_state *dt = &dm_thr;
@@ -385,25 +360,15 @@ static void optimal_settings(uint64_t freq, uint32_t rate)
 	if (verbosity >= 2) {
 		fprintf(stderr, "downsample_passes = %d (= # of fifth_order() iterations), downsample = %d\n", dm->downsample_passes, dm->downsample );
 	}
-	capture_freq = freq;
 	capture_rate = dm->downsample * dm->rate_in;
 	if (verbosity >= 2)
 		fprintf(stderr, "capture_rate = dm->downsample * dm->rate_in = %d * %d = %d\n", dm->downsample, dm->rate_in, capture_rate );
-	if (!d->offset_tuning) {
-		capture_freq = freq - capture_rate/4;
-		if (verbosity >= 2)
-			fprintf(stderr, "optimal_settings(freq = %f MHz): capture_freq = freq - capture_rate/4 = %f MHz\n", freq * 1E-6, capture_freq * 1E-6 );
-	}
-	capture_freq += cs->edge * dm->rate_in / 2;
-	if (verbosity >= 2)
-		fprintf(stderr, "optimal_settings(freq = %f MHz): capture_freq +=  cs->edge * dm->rate_in / 2 = %d * %d / 2 = %f MHz\n", freq * 1E-6, cs->edge, dm->rate_in, capture_freq * 1E-6 );
 	dm->output_scale = (1<<15) / (128 * dm->downsample);
 	if (dm->output_scale < 1) {
 		dm->output_scale = 1;}
 	if (dm->mode_demod == &fm_demod) {
 		dm->output_scale = 1;}
-	d->userFreq = freq;
-	d->freq = capture_freq;
+	d->freq = freq;
 	d->rate = capture_rate;
 	if (verbosity >= 2)
 		fprintf(stderr, "optimal_settings(freq = %f MHz) delivers freq %f MHz, rate %.0f\n", freq * 1E-6, d->freq * 1E-6, (double)d->rate );
@@ -412,30 +377,23 @@ static void optimal_settings(uint64_t freq, uint32_t rate)
 static void *controller_fn(void *arg)
 {
 	int i, r;
-	int32_t if_band_center_freq = 0;
 	struct controller_state *s = arg;
 	struct demod_state *demod = &dm_thr.demod;
 
-	if (s->wb_mode) {
-		if (verbosity)
-			fprintf(stderr, "wbfm: adding 16000 Hz to every input frequency\n");
-		for (i=0; i < s->freq_len; i++) {
-			s->freqs[i] += 16000;}
-	}
-
-	optimal_settings(s->freqs[0], demod->rate_in);
+	optimal_settings(s->center_freq, demod->rate_in);
 	if (dongle.direct_sampling) {
 		verbose_direct_sampling(dongle.dev, 1);}
-	if (dongle.offset_tuning) {
-		verbose_offset_tuning(dongle.dev);}
 
 	/* Set the frequency */
 	if (verbosity) {
-		fprintf(stderr, "verbose_set_frequency(%f MHz)\n", dongle.userFreq * 1E-6);
-		if (!dongle.offset_tuning)
-			fprintf(stderr, "  frequency is away from parametrized one, to avoid negative impact from dc\n");
+		fprintf(stderr, "verbose_set_frequency(%f MHz)\n", dongle.freq * 1E-6);
 	}
 	verbose_set_frequency(dongle.dev, dongle.freq);
+
+	for (i = 0; i < s->freq_len; ++i) {
+		mixer_init(&dm_thr.mixer, s->freqs[i], dongle.rate);
+	}
+
 	fprintf(stderr, "Oversampling input by: %ix.\n", demod->downsample);
 	fprintf(stderr, "Buffer size: %0.2fms\n",
 		1000 * 0.5 * (float)ACTUAL_BUF_LENGTH / (float)dongle.rate);
@@ -445,22 +403,6 @@ static void *controller_fn(void *arg)
 		fprintf(stderr, "verbose_set_sample_rate(%.0f Hz)\n", (double)dongle.rate);
 	verbose_set_sample_rate(dongle.dev, dongle.rate);
 	fprintf(stderr, "Output at %u Hz.\n", demod->rate_in/demod->post_downsample);
-
-	if ( dongle.bandwidth ) {
-		if_band_center_freq = dongle.userFreq - dongle.freq;
-		if (dongle.bccorner < 0)
-			if_band_center_freq += ( dongle.bandwidth - demod->rate_out ) / 2;
-		else if (dongle.bccorner > 0)
-			if_band_center_freq -= ( dongle.bandwidth - demod->rate_out ) / 2;
-
-		r = rtlsdr_set_tuner_band_center(dongle.dev, if_band_center_freq );
-		if (r)
-			fprintf(stderr, "WARNING: Failed to set band center.\n");
-		else {
-			if (verbosity)
-				fprintf(stderr, "rtlsdr_set_tuner_band_center(%.0f Hz) successful\n", (double)if_band_center_freq);
-		}
-	}
 
 	return 0;
 }
@@ -491,13 +433,8 @@ void dongle_init(struct dongle_state *s)
 	s->gain = AUTO_GAIN; /* tenths of a dB */
 	s->mute = 0;
 	s->direct_sampling = 0;
-	s->offset_tuning = 0;
 	s->demod_target = &dm_thr;
-	s->samplePowSum = 0.0;
-	s->samplePowCount = 0;
-	s->sampleMax = 0;
 	s->bandwidth = 0;
-	s->bccorner = 0;
 	s->buf_len = 32 * 512;  /* see rtl_tcp */
 
 	s->dc_block_raw = 0;
@@ -532,16 +469,14 @@ void output_cleanup(struct output_state *s)
 
 void controller_init(struct controller_state *s)
 {
-	s->freqs[0] = 100000000;
-	s->freq_len = 0;
-	s->edge = 0;
-	s->wb_mode = 0;
+	s->center_freq = 100000000;
+	s->freq_len = -1;
 }
 
 void sanity_checks(void)
 {
-	if (controller.freq_len == 0) {
-		fprintf(stderr, "Please specify a frequency.\n");
+	if (controller.freq_len <= 0) {
+		fprintf(stderr, "Please specify a center frequency (RF) and one more relative frequency\n");
 		exit(1);
 	}
 
@@ -560,7 +495,6 @@ int main(int argc, char **argv)
 	int r, opt;
 	int dev_given = 0;
 	int writeWav = 0;
-	int custom_ppm = 0;
 	int enable_biastee = 0;
 	const char * rtlOpts = NULL;
 	enum rtlsdr_ds_mode ds_mode = RTLSDR_DS_IQ;
@@ -582,11 +516,19 @@ int main(int argc, char **argv)
 		case 'f':
 			if (controller.freq_len >= FREQUENCIES_LIMIT) {
 				break;}
-			if (strchr(optarg, ':'))
-				{frequency_range(&controller, optarg);}
+			if (strchr(optarg, ':')) {
+				if ( controller.freq_len == -1 ) {
+					fprintf(stderr, "error: 1st frequency parameter must be single frequency\n");
+					exit(1);
+				}
+				frequency_range(&controller, optarg);
+			}
 			else
 			{
-				controller.freqs[controller.freq_len] = (uint32_t)atofs(optarg);
+				if ( controller.freq_len >= 0 )
+					controller.freqs[controller.freq_len] = (uint32_t)atofs(optarg);
+				else
+					controller.center_freq = (uint32_t)atofs(optarg);
 				controller.freq_len++;
 			}
 			break;
@@ -606,7 +548,6 @@ int main(int argc, char **argv)
 			break;
 		case 'p':
 			dongle.ppm_error = atoi(optarg);
-			custom_ppm = 1;
 			break;
 		case 'R':
 			time(&stop_time);
@@ -618,9 +559,7 @@ int main(int argc, char **argv)
 			}
 			break;
 		case 'E':
-			if (strcmp("edge",  optarg) == 0) {
-				controller.edge = 1;}
-			if (strcmp("dc", optarg) == 0 || strcmp("adc", optarg) == 0) {
+			if (strcmp("adc", optarg) == 0) {
 				demod->dc_block_audio = 1;}
 			if (strcmp("rdc", optarg) == 0) {
 				dongle.dc_block_raw = demod->omit_dc_fix = 1;}
@@ -628,16 +567,8 @@ int main(int argc, char **argv)
 				demod->deemph = 1;}
 			if (strcmp("direct",  optarg) == 0) {
 				dongle.direct_sampling = 1;}
-			if (strcmp("offset",  optarg) == 0) {
-				dongle.offset_tuning = 1;}
-			if (strcmp("rtlagc", optarg) == 0 || strcmp("agc", optarg) == 0) {
+			if (strcmp("rtlagc", optarg) == 0) {
 				rtlagc = 1;}
-			if (strcmp("bclo", optarg) == 0 || strcmp("bcL", optarg) == 0 || strcmp("bcl", optarg) == 0) {
-				dongle.bccorner = -1; }
-			if (strcmp("bcc", optarg) == 0 || strcmp("bcC", optarg) == 0) {
-				dongle.bccorner = 0; }
-			if (strcmp("bchi", optarg) == 0 || strcmp("bcH", optarg) == 0 || strcmp("bch", optarg) == 0) {
-				dongle.bccorner = 1; }
 			break;
 		case 'O':
 			rtlOpts = optarg;
@@ -672,7 +603,6 @@ int main(int argc, char **argv)
 			if (strcmp("lsb", optarg) == 0) {
 				demod->mode_demod = &lsb_demod;}
 			if (strcmp("wbfm",  optarg) == 0 || strcmp("wfm",  optarg) == 0) {
-				controller.wb_mode = 1;
 				demod->mode_demod = &fm_demod;
 				demod->rate_in = 170000;
 				demod->rate_out = 170000;

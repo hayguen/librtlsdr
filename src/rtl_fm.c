@@ -1141,7 +1141,6 @@ int main(int argc, char **argv)
 	int r, opt;
 	int dev_given = 0;
 	int writeWav = 0;
-	int custom_ppm = 0;
 	int enable_biastee = 0;
 	const char * rtlOpts = NULL;
 	enum rtlsdr_ds_mode ds_mode = RTLSDR_DS_IQ;
@@ -1217,7 +1216,6 @@ int main(int argc, char **argv)
 			break;
 		case 'p':
 			dongle.ppm_error = atoi(optarg);
-			custom_ppm = 1;
 			break;
 		case 'R':
 			time(&stop_time);
