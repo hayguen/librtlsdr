@@ -66,6 +66,29 @@
 
 #define DEFAULT_SAMPLE_RATE		24000
 
+
+/* detect compiler flavour */
+#if defined(_MSC_VER)
+#  define RESTRICT __restrict
+#pragma warning( disable : 4244 4305 4204 4456 )
+#elif defined(__GNUC__)
+#  define RESTRICT __restrict
+#else
+#  define RESTRICT
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma push_macro("FORCE_INLINE")
+#define FORCE_INLINE static inline __attribute__((always_inline))
+#else
+#error "Macro name collisions may happen with unsupported compiler."
+#ifdef FORCE_INLINE
+#undef FORCE_INLINE
+#endif
+#define FORCE_INLINE static inline
+#endif
+
+
 typedef int16_t lut_type;  /* 16 bit reduces CPU cache consumption */
 static lut_type *atan_lut_tab = NULL;
 static int atan_lut_size = 131072; /* => 256 KB for int16_t , 512 KB for int32_t */
@@ -175,10 +198,10 @@ void rotate_neg90(unsigned char *buf, uint32_t len)
 
 #define MIXER_PREC          14  /* mixer values have precision */
 #define MIXER_ADD_PREC      2   /* add precision from input[] to output[] */
-#define MIXER_INV_SQRT_SZ   16  /* size of mixer->inv_sqrt[] */
+#define MIXER_INV_SQRT_SZ   32  /* size of mixer->inv_sqrt[] */
 #define MIXER_TAB_SZ        16  /* size of mixer->mix[] */
 
-static void mixer_fp_unit_normalize(struct mixer_state *mixer, int16_t *c)
+FORCE_INLINE void mixer_fp_unit_normalize(const struct mixer_state * RESTRICT mixer, int16_t * RESTRICT c)
 {
 	int32_t inv_sqrt, pwr = ( (int32_t)c[0] * c[0] + (int32_t)c[1] * c[1] ) >> MIXER_PREC;
 	int index = pwr - (1 << MIXER_PREC) + (MIXER_INV_SQRT_SZ / 2);
@@ -188,20 +211,23 @@ static void mixer_fp_unit_normalize(struct mixer_state *mixer, int16_t *c)
 	c[1] = (c[1] * inv_sqrt) >> MIXER_PREC;
 }
 
-static void mixer_fp_complex_mul(struct mixer_state *mixer, const int16_t *a, const int16_t *b, int16_t *c)
+FORCE_INLINE void mixer_fp_complex_mul(const int16_t * RESTRICT a, const int16_t * RESTRICT b, int16_t * RESTRICT c)
 {
 	c[0] = ( (int32_t)a[0] * b[0] - (int32_t)a[1] * b[1] ) >> MIXER_PREC;
 	c[1] = ( (int32_t)a[0] * b[1] + (int32_t)a[1] * b[0] ) >> MIXER_PREC;
 }
 
-static void mixer_fp_complex_mul_pprec(struct mixer_state *mixer, const int16_t *a, const int16_t *b, int16_t *c)
+FORCE_INLINE void mixer_fp_complex_mul_pprec(const int16_t * RESTRICT a, const int16_t * RESTRICT b, int16_t * RESTRICT c)
 {
 	c[0] = ( (int32_t)a[0] * b[0] - (int32_t)a[1] * b[1] ) >> (MIXER_PREC - MIXER_ADD_PREC);
 	c[1] = ( (int32_t)a[0] * b[1] + (int32_t)a[1] * b[0] ) >> (MIXER_PREC - MIXER_ADD_PREC);
 }
 
+typedef int16_t cplx16[2];
+
 void mixer_init(struct mixer_state *mixer, double rel_freq, double samplerate)
 {
+	cplx16 * const mix = mixer->mix;
 	const double flt_one = (double)(1 << MIXER_PREC);
 	const double dphi = -2.0 * M_PI * rel_freq / samplerate;
 
@@ -211,27 +237,27 @@ void mixer_init(struct mixer_state *mixer, double rel_freq, double samplerate)
 		mixer->inv_sqrt[k] = (int16_t)round(inv_sqrt);
 	}
 
-	mixer->mix[0][0] = (int16_t)( flt_one * cos(dphi) );
-	mixer->mix[0][1] = (int16_t)( flt_one * sin(dphi) );
-	mixer_fp_unit_normalize(mixer, mixer->mix[0]);
+	mix[0][0] = (int16_t)( flt_one * cos(dphi) );
+	mix[0][1] = (int16_t)( flt_one * sin(dphi) );
+	mixer_fp_unit_normalize(mixer, mix[0]);
+	mixer->skip = (mix[0][0] == (1 << MIXER_PREC) && mix[0][1] == 0) ? 1 : 0;
 
 	for (int k = 1; k < MIXER_TAB_SZ; ++k) {
-		mixer_fp_complex_mul(mixer, mixer->mix[k-1], mixer->mix[0], mixer->mix[k]);
-		mixer_fp_unit_normalize(mixer, mixer->mix[k]);
+		mixer_fp_complex_mul(mix[k-1], mix[0], mix[k]);
+		mixer_fp_unit_normalize(mixer, mix[k]);
 	}
 
 	mixer->rot[0] = 1 << MIXER_PREC;
 	mixer->rot[1] = 0;
 
 	mixer->index = -1;
-	if (mixer->mix[0][0] == (1 << MIXER_PREC) && mixer->mix[0][1] == 0 )
-		mixer->skip = 1;
-	else
-		mixer->skip = 0;
 }
 
-void mixer_apply(struct mixer_state *mixer, int len, const int16_t *inp, int16_t *out)
+void mixer_apply(struct mixer_state *mixer, int len, const int16_t *inp_, int16_t *out_)
 {
+	const cplx16 * const RESTRICT mix = mixer->mix;
+	const int16_t * RESTRICT inp = inp_;
+	int16_t * RESTRICT out = out_;
 	int16_t rot[2], tmp[2];
 	int index;
 
@@ -239,7 +265,7 @@ void mixer_apply(struct mixer_state *mixer, int len, const int16_t *inp, int16_t
 	{
 		if (out == inp)
 			return;
-		for (int i = 0; i < len; ++len)
+		for (int i = 0; i < len; ++i)
 			out[i] = inp[i];
 		return;
 	}
@@ -253,7 +279,7 @@ void mixer_apply(struct mixer_state *mixer, int len, const int16_t *inp, int16_t
 			/* advance rot: rot = rot * mix[index] */
 			tmp[0] = rot[0];
 			tmp[1] = rot[1];
-			mixer_fp_complex_mul(mixer, tmp, mixer->mix[index], rot);
+			mixer_fp_complex_mul(tmp, mix[index], rot);
 			/* and normalize: rot = rot / |rot| */
 			mixer_fp_unit_normalize(mixer, rot);
 		}
@@ -261,11 +287,11 @@ void mixer_apply(struct mixer_state *mixer, int len, const int16_t *inp, int16_t
 		/* tmp allows out == inp */
 		tmp[0] = inp[off];
 		tmp[1] = inp[off+1];
-		mixer_fp_complex_mul_pprec(mixer, tmp, rot, &out[off]);
+		mixer_fp_complex_mul_pprec(tmp, rot, &out[off]);
 		index = 0;
 		for (int k = 2; k < left; k += 2) {
-			mixer_fp_complex_mul_pprec(mixer, &inp[off + k], rot, tmp); /* tmp = inp[] * rot */
-			mixer_fp_complex_mul(mixer, tmp, mixer->mix[index++], &out[off + k]); /* out[] = tmp * mix[index] */
+			mixer_fp_complex_mul_pprec(&inp[off + k], rot, tmp); /* tmp = inp[] * rot */
+			mixer_fp_complex_mul(tmp, mix[index++], &out[off + k]); /* out[] = tmp * mix[index] */
 		}
 	}
 	mixer->index = index;

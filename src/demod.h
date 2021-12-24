@@ -40,7 +40,7 @@
 
 struct mixer_state
 {
-	int16_t   inv_sqrt[16];   /* precalculated inverse square root() */
+	int16_t   inv_sqrt[32];   /* precalculated inverse square root() */
 	int16_t   mix[16][2];	  /* out[i] = inp[i] * mix[(i-1) % 16] * rot */
 	int16_t   rot[2];         /* complex rotation multiplicator: mix[k] = mix[k-1] * rot[0] */
 	int	  index;          /* next index to use of mix[] */
