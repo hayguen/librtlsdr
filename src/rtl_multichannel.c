@@ -66,10 +66,13 @@
 #define AUTO_GAIN				-100
 #define DEFAULT_BUFFER_DUMP		4096
 
-#define MAX_NUM_CHANNELS  32
-#define RING_COUNT        4
+#define MAX_NUM_CHANNELS        32
+#define NUM_CIRCULAR_BUFFERS    4
 
 #define ONE_SEC_TO_USEC 1000.0
+
+#define likely(x)	__builtin_expect(!!(x), 1)
+#define unlikely(x)	__builtin_expect(!!(x), 0)
 
 static int BufferDump = DEFAULT_BUFFER_DUMP;
 static int OutputToStdout = 1;
@@ -104,15 +107,15 @@ struct multi_demod_state
 	struct demod_state demod_states[MAX_NUM_CHANNELS];
 	pthread_t thread;
 	int channel_count;
-	int16_t  lowpassed[RING_COUNT][MAXIMUM_BUF_LENGTH];
-	atomic_int  ring_buffer_free[RING_COUNT];
+	int16_t  lowpassed[NUM_CIRCULAR_BUFFERS][MAXIMUM_BUF_LENGTH];
+	atomic_int  ring_buffer_free[NUM_CIRCULAR_BUFFERS];
 	int      lp_len;
 	int      r_ring_index;
 	int      w_ring_index;
 	I_FILE     *fptr[MAX_NUM_CHANNELS];
     I_FILE     *mpx_fptr[MAX_NUM_CHANNELS];
-	char *ffmpeg_command;
-	char *redsea_command;
+	char *audio_pipe_command;
+	char *mpx_pipe_command;
 	uint32_t freqs[MAX_NUM_CHANNELS];
 	int	  freq_len;
 	int	  exit_flag;
@@ -192,14 +195,14 @@ struct cmd_state cmd;
 void usage(void)
 {
 	fprintf(stderr,
-		"rtl_fm, a simple demodulator for RTL2832 based SDR-receivers\n"
-		"rtl_fm  version %d.%d %s (%s)\n"
+		"rtl_multichannel, a simple demodulator for RTL2832 based SDR-receivers\n"
+		"rtl_multichannel  version %d.%d %s (%s)\n"
 		"rtl-sdr library %d.%d %s\n\n",
 		APP_VER_MAJOR, APP_VER_MINOR, APP_VER_ID, __DATE__,
 		rtlsdr_get_version() >>16, rtlsdr_get_version() & 0xFFFF,
 		rtlsdr_get_ver_id() );
 	fprintf(stderr,
-		"Usage:\trtl_fm -f freq [-options] [filename]\n"
+		"Usage:\trtl_multichannel -f freq [-options] [filename]\n"
 		"\t-f frequency_to_tune_to [Hz]\n"
 		"\t	use multiple -f for scanning (requires squelch)\n"
 		"\t	ranges supported, -f 118M:137M:25k\n"
@@ -265,7 +268,7 @@ void usage(void)
 #endif
 		"\n"
 		"Produces signed 16 bit ints, use Sox or aplay to hear them.\n"
-		"\trtl_fm ... | play -t raw -r 24k -es -b 16 -c 1 -V1 -\n"
+		"\trtl_multichannel ... | play -t raw -r 24k -es -b 16 -c 1 -V1 -\n"
 		"\t		   | aplay -r 24000 -f S16_LE -t raw -c 1\n"
 		"\t  -M wbfm  | play -r 32k ... \n"
 		"\t  -s 22050 | multimon -t raw /dev/stdin\n\n"
@@ -564,23 +567,23 @@ static void checkTriggerCommand(struct cmd_state *c, unsigned char adcSampleMax,
 	c->numSummed++;
 }
 
-I_FILE* open_ffmpeg_pipe(char *file_name, int demod_id, char* command){
-	I_FILE *ptr = (struct I_FILE*)malloc(sizeof(struct I_FILE*));
+I_FILE* open_audio_pipe(char *file_name, int demod_id, char* command){
+	I_FILE *ptr = (struct I_FILE*)malloc(sizeof(struct I_FILE));
 	sprintf(file_name, "%d", demod_id);
 	strcat(command, " ");
 	strcat(command, file_name);
-	//strcat(ffmpeg_command, " > /dev/null");
+	//strcat(audio_pipe_command, " > /dev/null");
 	ptr->f = popen(command, "w");
 	ptr->name = strdup(file_name);
 	return ptr;
 }
 
-I_FILE* open_redsea_pipe(char *file_name, int demod_id, char* command){
-	I_FILE *ptr = (struct I_FILE*)malloc(sizeof(struct I_FILE*));
+I_FILE* open_mpx_pipe(char *file_name, int demod_id, char* command){
+	I_FILE *ptr = (struct I_FILE*)malloc(sizeof(struct I_FILE));
 	sprintf(file_name, "%d-mpx", demod_id);
 	strcat(command, " ");
 	strcat(command, file_name);
-	//strcat(redsea_command, " > /dev/null");
+	//strcat(mpx_pipe_command, " > /dev/null");
 	ptr->f = popen(command, "w");
 	ptr->name = strdup(file_name);
 	return ptr;
@@ -813,7 +816,7 @@ static void *multi_demod_thread_fn(void *arg)
 		diff = (t2.tv_sec - t1.tv_sec) * 1000.0;
 		diff += (t2.tv_usec - t1.tv_usec) / 1000.0;
 
-		if (diff > ONE_SEC_TO_USEC * mds->split_duration) { 
+		if (unlikely(mds->split_duration > 0 && diff > ONE_SEC_TO_USEC * mds->split_duration)) { 
 			
 			current_time = time(NULL);
             tm = localtime(&current_time);
@@ -823,26 +826,28 @@ static void *multi_demod_thread_fn(void *arg)
 				current_time = time(NULL);
 				tm = localtime(&current_time);
 
-				if (strlen(mds->ffmpeg_command) == 0 || strlen(mds->redsea_command) == 0) {
+				if (strlen(mds->audio_pipe_command) == 0 ) {
 					recording_file_name = generate_iq_file_name(mds->fptr[demod_idx]->name);
 					fclose(mds->fptr[demod_idx]->f);
 					free(mds->fptr[demod_idx]->name);
 					mds->fptr[demod_idx] = create_iq_file(mds->fptr[demod_idx], recording_file_name);
+				} else {
+					recording_file_name = generate_iq_file_name(mds->fptr[demod_idx]->name);
+					pclose(mds->fptr[demod_idx]->f);
+					free(mds->fptr[demod_idx]); //free old one
+					mds->fptr[demod_idx] = open_audio_pipe(recording_file_name, demod_idx, mds->audio_pipe_command);
+				}
 
+				if (strlen(mds->mpx_pipe_command) == 0) {
 					recording_file_name = generate_iq_file_name(mds->mpx_fptr[demod_idx]->name);
 					fclose(mds->mpx_fptr[demod_idx]->f);
 					free(mds->mpx_fptr[demod_idx]->name);
 					mds->mpx_fptr[demod_idx] = create_iq_file(mds->mpx_fptr[demod_idx], recording_file_name);
 				} else {
-					recording_file_name = generate_iq_file_name(mds->fptr[demod_idx]->name);
-					pclose(mds->fptr[demod_idx]->f);
-					free(mds->fptr[demod_idx]->name);
-					mds->fptr[demod_idx] = open_ffmpeg_pipe(recording_file_name, demod_idx, mds->ffmpeg_command);
-
 					recording_file_name = generate_iq_file_name(mds->mpx_fptr[demod_idx]->name);
 					pclose(mds->mpx_fptr[demod_idx]->f);
-					free(mds->mpx_fptr[demod_idx]->name);
-					mds->mpx_fptr[demod_idx] = open_redsea_pipe(recording_file_name, demod_idx, mds->redsea_command);
+					free(mds->mpx_fptr[demod_idx]); //free old one
+					mds->mpx_fptr[demod_idx] = open_mpx_pipe(recording_file_name, demod_idx, mds->mpx_pipe_command);
 				}
 				gettimeofday(&t1, NULL);
 				free((void *)recording_file_name);
@@ -1089,13 +1094,13 @@ void multi_demod_state_init(struct multi_demod_state *s, struct cmd_state *cmd)
         get_nprocs_conf(), get_nprocs());
 	s->r_ring_index = 0;
 	s->w_ring_index = 0;
-	s->split_duration = 60;
-	for (int i = 0; i < RING_COUNT; i++)
+	s->split_duration = -1;
+	for (int i = 0; i < NUM_CIRCULAR_BUFFERS; i++)
 	{
 		s->ring_buffer_free[i] = 1;
 	}
-	s->redsea_command = "";
-	s->ffmpeg_command = "";
+	s->mpx_pipe_command = "";
+	s->audio_pipe_command = "";
 	pthread_rwlock_init(&s->rw, NULL);
 	pthread_cond_init(&s->ready, NULL);
 	pthread_mutex_init(&s->ready_m, NULL);
@@ -1106,24 +1111,28 @@ void multi_demod_state_init(struct multi_demod_state *s, struct cmd_state *cmd)
 	s->cmd = cmd;
 }
 
-void multi_demod_init_fptrs(struct multi_demod_state *s, char* redsea_command, char* ffmpeg_command){
+void multi_demod_init_fptrs(struct multi_demod_state *s, char* mpx_pipe_command, char* audio_pipe_command){
 	char *file_name;
 	file_name = (char *) malloc(50 * sizeof(char));
 	memset(file_name, 0, 50);
 
 	for(int i=0; i<s->channel_count; i++) {
-		s->fptr[i] = (I_FILE *) malloc(sizeof(I_FILE));
-		s->mpx_fptr[i] = (I_FILE *) malloc(sizeof(I_FILE));
+		s->fptr[i] = (I_FILE *) malloc(sizeof(struct I_FILE));
+		s->mpx_fptr[i] = (I_FILE *) malloc(sizeof(struct I_FILE));
 	    sprintf(file_name, "%d", i);
 
-		if (strlen(dm_thr.ffmpeg_command) != 0 && strlen(dm_thr.redsea_command) != 0) {
-			s->fptr[i] = open_ffmpeg_pipe(file_name, i, ffmpeg_command);
-			sprintf(file_name, "%d-mpx", i);
-			s->mpx_fptr[i] = open_redsea_pipe(file_name, i, redsea_command);
+		if (strlen(dm_thr.audio_pipe_command) != 0) {
+			s->fptr[i] = open_audio_pipe(file_name, i, audio_pipe_command);
 		} else {
 			s->fptr[i]->f = fopen(generate_iq_file_name(file_name), "wb");
 			s->fptr[i]->name = strdup(file_name);
-			sprintf(file_name, "%d-mpx", i);
+			
+		}
+		sprintf(file_name, "%d-mpx", i);
+
+		if (strlen(dm_thr.mpx_pipe_command) != 0) {
+			s->mpx_fptr[i] = open_mpx_pipe(file_name, i, mpx_pipe_command);
+		} else {
 			s->mpx_fptr[i]->f = fopen(generate_iq_file_name(file_name), "wb");
 			s->mpx_fptr[i]->name = strdup(file_name);
 		}
@@ -1150,10 +1159,10 @@ void sanity_checks(void)
 		exit(1);
 	}
 
-	/* if (controller.freq_len > 1 && dm_thr.demod.squelch_level == 0) {
+    /*if (controller.freq_len > 1 && dm_thr.demod.squelch_level == 0) {
 		fprintf(stderr, "Please specify a squelch level.  Required for scanning multiple frequencies.\n");
 		exit(1);
-	} */
+	}*/
 
 }
 
@@ -1262,10 +1271,10 @@ int main(int argc, char **argv)
 			dongle.rdc_block_const = atoi(optarg);
 			break;
 		case 'a':
-			dm_thr.ffmpeg_command = optarg;
+			dm_thr.audio_pipe_command = optarg;
 			break;
 		case 'x':
-			dm_thr.redsea_command = optarg;
+			dm_thr.mpx_pipe_command = optarg;
 			break;
 		case 'F':
 			demod->downsample_passes = 1;  /* truthy placeholder */
@@ -1344,7 +1353,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	multi_demod_init_fptrs(&dm_thr, dm_thr.redsea_command, dm_thr.ffmpeg_command);
+	multi_demod_init_fptrs(&dm_thr, dm_thr.mpx_pipe_command, dm_thr.audio_pipe_command);
 	init_demods();
 
 	if (verbosity)
