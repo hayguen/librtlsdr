@@ -51,10 +51,8 @@ struct demod_state
 {
 	int16_t * lowpassed;	/* input and decimated quadrature I/Q sample-pairs */
 	int16_t * result;	/* demodulated inphase signal */
-	int16_t * result_mpx;	/* demodulated inphase signal */
 	int	  lp_len;	/* number of valid samples in lowpassed[] - NOT quadrature I/Q sample-pairs! */
 	int	  result_len;	/* number of valid samples in result[] */
-	int	  result_mpx_len;	/* number of valid samples in result[] */
 
 #if 1
 	int16_t   lp_i_hist[MAXIMUM_DOWNSAMPLE_PASSES][6];
