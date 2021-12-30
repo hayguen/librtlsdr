@@ -253,6 +253,38 @@ static double log2(double n)
 }
 #endif
 
+void parse_file_pipe_args(char* arg, SIGNAL_TYPE st) {
+	//checking pipe or file
+	char *t_arg = strdup(arg);
+	char delim[] = ":";
+	char *ptr = strtok(arg, delim);
+	t_arg = t_arg + 2; //get rid of f/p: part
+	switch (st){
+		case AUDIO:
+			if(strcmp("f", ptr) == 0) {
+				dm_thr.audio_write_file = 1;
+			} else if (strcmp("p", ptr) == 0) {
+				dm_thr.audio_pipe_command = t_arg;
+			} else goto err;
+			break;
+		case MPX:
+			if(strcmp("f", ptr) == 0) {
+				dm_thr.mpx_write_file = 1;
+			} else if (strcmp("p", ptr) == 0) {
+				dm_thr.mpx_pipe_command = t_arg;
+			} else goto err;
+			break;
+		default:
+			goto err;
+	}
+
+	return;
+
+err:
+	fprintf(stderr, "error occured while -a command. please check!"); 
+	exit(0);
+}
+
 
 char * generate_file_name(char* filename, FILE_EXTENSION fe) {
 
@@ -772,7 +804,7 @@ int main(int argc, char **argv)
 	demod_thread_state_init(&dm_thr);
 	demod = dm_thr.config_demod_state;
 
-	while ((opt = getopt(argc, argv, "d:f:g:m:s:a:x:t:r:p:R:E:O:F:A:M:hTbnq:c:w:W:D:Hv")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:g:m:s:a:x:t:r:p:R:E:O:F:A:M:hTq:c:w:W:D:Hv")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
@@ -844,16 +876,10 @@ int main(int argc, char **argv)
 			dongle.rdc_block_const = atoi(optarg);
 			break;
 		case 'a':
-			dm_thr.audio_pipe_command = optarg;
+			parse_file_pipe_args(optarg, AUDIO);
 			break;
 		case 'x':
-			dm_thr.mpx_pipe_command = optarg;
-			break;
-		case 'b':
-			dm_thr.audio_write_file = 1;
-			break;
-		case 'n':
-			dm_thr.mpx_write_file = 1;
+			parse_file_pipe_args(optarg, MPX);
 			break;
 		case 'F':
 			demod->downsample_passes = 1;  /* truthy placeholder */
