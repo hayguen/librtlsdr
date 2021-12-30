@@ -256,28 +256,30 @@ static double log2(double n)
 
 char * generate_file_name(char* filename, FILE_EXTENSION fe) {
 
-	struct timeval timestamp;
     time_t current_time;
 	struct tm *tm;
 	char *new_file_name;
+	char timestamp[20];
 	char delim[] = "_";
 	char *ptr = strtok(filename, delim);
 
     current_time = time(NULL);
     tm = localtime(&current_time);
-	gettimeofday(&timestamp, NULL);
     new_file_name = (char *) malloc(100 * sizeof(char));
 	memset(new_file_name, 0, 100);
-    sprintf(new_file_name, "%s_%02d-%02d-%d_%02d:%02d:%02d:%03ld.", ptr, tm->tm_mday, tm->tm_mon+1, tm->tm_year+1900, tm->tm_hour, tm->tm_min, tm->tm_sec, timestamp.tv_usec%1000);
+	sprintf(new_file_name, "%s", ptr);
+	strftime(timestamp, 100, "_%d-%m-%Y_%H:%M:%S", tm);
+	strcat(new_file_name, timestamp);
+    //sprintf(new_file_name, "%s_%02d-%02d-%d_%02d:%02d:%02d:%03ld.", ptr, tm->tm_mday, tm->tm_mon+1, tm->tm_year+1900, tm->tm_hour, tm->tm_min, tm->tm_sec, timestamp.tv_usec%1000);
 	switch (fe){
 		case RAW:
-			strcat(new_file_name, "raw");
+			strcat(new_file_name, ".raw");
 			break;
 		case MP3:
-			strcat(new_file_name, "mp3");
+			strcat(new_file_name, ".mp3");
 			break;
 		case TXT:
-			strcat(new_file_name, "txt");
+			strcat(new_file_name, ".txt");
 			break;
 	}
 	return new_file_name;
