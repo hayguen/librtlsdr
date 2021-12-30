@@ -151,6 +151,16 @@ struct dongle_state
 struct dongle_state dongle;
 struct demod_thread_state dm_thr;
 
+static char * trim(char * s) {
+	char *p = s;
+	int l = strlen(p);
+
+	while(isspace(p[l - 1])) p[--l] = 0;
+	while(*p && isspace(*p)) ++p;
+
+	return p;
+}
+
 void usage(void)
 {
 	fprintf(stderr,
@@ -419,32 +429,34 @@ static void *multi_demod_thread_fn(void *arg)
 		diff_ms = (t2.tv_sec - t1.tv_sec) * 1000.0;
 		diff_ms += (t2.tv_usec - t1.tv_usec) / 1000.0;
 		if (unlikely(mds->split_duration > 0 && diff_ms > 1000.0 * mds->split_duration)) {
-
 			for (int demod_idx=0; demod_idx<mds->channel_count; ++demod_idx) {
 				char* recording_file_name;
+				int freq;
+
+				freq = (mds->center_freq + mds->freqs[demod_idx])/10000;
 				if (!mds->audio_pipe_command) {
-					recording_file_name = generate_iq_file_name(mds->fptr[demod_idx]->name);
+					recording_file_name = generate_file_name(mds->fptr[demod_idx]->name, RAW);
 					fclose(mds->fptr[demod_idx]->f);
 					free(mds->fptr[demod_idx]->name);
 					mds->fptr[demod_idx] = create_iq_file(mds->fptr[demod_idx], recording_file_name);
-				} else if(strlen(mds->audio_pipe_command) != 0 ){
+				} else {
 					recording_file_name = generate_file_name(mds->fptr[demod_idx]->name, MP3);
 					pclose(mds->fptr[demod_idx]->f);
 					free(mds->fptr[demod_idx]); //free old one
 					mds->fptr[demod_idx] = open_pipe(recording_file_name, demod_idx, freq, mds->audio_pipe_command, AUDIO);
 				}
 
-				if (mds->mpx_write_file) {
+				if (!mds->mpx_pipe_command) {
 					recording_file_name = generate_file_name(mds->mpx_fptr[demod_idx]->name, RAW);
 					fflush(mds->mpx_fptr[demod_idx]->f);
 					fclose(mds->mpx_fptr[demod_idx]->f);
 					free(mds->mpx_fptr[demod_idx]->name);
 					mds->mpx_fptr[demod_idx] = create_iq_file(mds->mpx_fptr[demod_idx], recording_file_name);
-				} else if (strlen(mds->mpx_pipe_command) != 0) {
+				} else {
 					recording_file_name = generate_file_name(mds->mpx_fptr[demod_idx]->name, TXT);
 					pclose(mds->mpx_fptr[demod_idx]->f);
 					free(mds->mpx_fptr[demod_idx]); /* free old one */
-					mds->mpx_fptr[demod_idx] = open_mpx_pipe(recording_file_name, demod_idx, mds->mpx_pipe_command);
+					mds->mpx_fptr[demod_idx] = open_pipe(recording_file_name, demod_idx, freq, mds->mpx_pipe_command, MPX);
 				}
 				gettimeofday(&t1, NULL);
 				free((void *)recording_file_name);
@@ -468,8 +480,6 @@ static void *multi_demod_thread_fn(void *arg)
 		for (ch = 0; ch < mds->channel_count; ++ch) {
 			struct demod_state *d = &mds->demod_states[ch];
 			full_demod(&mds->demod_states[ch], mds->mpx_fptr[ch]->f, mds->fptr[ch]->f);
-			//fwrite(d->result, 2, d->result_len, mds->fptr[ch]->f); //for audio output
-			//fwrite(d->result_mpx, 2, d->result_mpx_len, mds->mpx_fptr[ch]->f); //for mpx signal
 		}
 
 		if (do_exit)
@@ -556,7 +566,6 @@ static int controller_fn(struct demod_thread_state *s)
 		/* allocate memory per channel */
 		demod_init(&dm_thr.demod_states[i], 0, 1);
 	}
-	dm_thr.channel_count = s->freq_len;
 	fprintf(stderr, "Multichannel will demodulate %d channels.\n", dm_thr.channel_count);
 
 	fprintf(stderr, "Oversampling input by: %ix.\n", demod_config->downsample);
@@ -618,6 +627,7 @@ void init_demods()
 	for(int i=0; i<dm_thr.channel_count; i++) {
 		struct demod_state *s = &dm_thr.demod_states[i];
 		demod_copy_fields(s, conf);
+		demod_copy_config(s, conf);
 		demod_init(s, 0, 1);
 	}
 }
@@ -647,34 +657,34 @@ void demod_thread_state_init(struct demod_thread_state *s)
 	pthread_mutex_init(&s->ready_m, NULL);
 }
 
-void multi_demod_init_fptrs(struct demod_thread_state *s, char* mpx_pipe_command, char* audio_pipe_command)
+void multi_demod_init_fptrs(struct demod_thread_state *s)
 {
 	char *file_name;
 	file_name = (char *) malloc(50 * sizeof(char));
 	memset(file_name, 0, 50);
 
-	if (strlen(dm_thr.audio_pipe_command) != 0 && dm_thr.audio_write_file)
+	if (dm_thr.audio_pipe_command && dm_thr.audio_write_file)
 	{
 		fprintf(stderr, "cannot write audio signal to pipe and file at the same time! Exiting..\n");
 		exit(0);
-	} else if(strlen(dm_thr.audio_pipe_command) == 0 && !dm_thr.audio_write_file){
+	} else if(!dm_thr.audio_pipe_command && !dm_thr.audio_write_file){
 		fprintf(stderr, "either write audio signal pipe or file must! Exiting..\n");
 		exit(0);
 	}
 
-	if (strlen(dm_thr.mpx_pipe_command) != 0 && dm_thr.mpx_write_file)
+	if (dm_thr.mpx_pipe_command && dm_thr.mpx_write_file)
 	{
 		fprintf(stderr, "cannot write mpx signal to pipe and file at the same time! Exiting..");
 		exit(0);
 	}
 
-	for(int i=0; i<s->freq_len; i++) {
+	for(int i=0; i<s->channel_count; i++) {
 		int freq = (s->center_freq + s->freqs[i])/10000;
 		s->fptr[i] = (I_FILE *) malloc(sizeof(struct I_FILE));
 		s->mpx_fptr[i] = (I_FILE *) malloc(sizeof(struct I_FILE));
 	    sprintf(file_name, "%04u", freq);
 
-		if (strlen(dm_thr.audio_pipe_command) != 0) {
+		if (dm_thr.audio_pipe_command) {
 			s->fptr[i] = open_pipe(generate_file_name(file_name, MP3), i, freq, s->audio_pipe_command, AUDIO);
 		} else if (dm_thr.audio_write_file){
 			s->fptr[i]->f = fopen(generate_file_name(file_name, RAW), "wb");
@@ -683,7 +693,7 @@ void multi_demod_init_fptrs(struct demod_thread_state *s, char* mpx_pipe_command
 
 		memset(file_name, 0, 50);
 
-		if (strlen(dm_thr.mpx_pipe_command) != 0) {
+		if (dm_thr.mpx_pipe_command) {
 			sprintf(file_name, "rds-%04u", freq);
 			s->mpx_fptr[i] = open_pipe(generate_file_name(file_name, TXT), i, freq, s->mpx_pipe_command, MPX);
 		} else if (dm_thr.mpx_write_file) {
@@ -704,14 +714,14 @@ void demod_thread_cleanup(struct demod_thread_state *s)
 
 	for(int i=0; i<s->channel_count; i++) {
 		demod_cleanup(&s->demod_states[i]);
-		if (strlen(dm_thr.audio_pipe_command) != 0) {
+		if (dm_thr.audio_pipe_command) {
 			pclose(s->fptr[i]->f);
 		} else {
 			fflush(s->fptr[i]->f);
 			fclose(s->fptr[i]->f);
 		}
 
-		if (strlen(dm_thr.mpx_pipe_command) != 0) {
+		if (dm_thr.mpx_pipe_command) {
 			pclose(s->mpx_fptr[i]->f);
 		} else {
 			fflush(s->mpx_fptr[i]->f);
