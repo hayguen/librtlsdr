@@ -67,7 +67,7 @@
 #define AUTO_GAIN				-100
 
 #define MAX_NUM_CHANNELS        32
-#define NUM_CIRCULAR_BUFFERS    4
+#define MAX_CIRCULAR_BUFFERS    32
 
 #define DEFAULT_MPX_PIPE_PATTERN	"redsea -r %sf >%F_%H-%M-%S_%#_ch-%cf_rds.txt"
 #define DEFAULT_MPX_FILE_PATTERN	"%F_%H-%M-%S_%#_ch-%cf_mpx.raw"
@@ -92,7 +92,7 @@ int duration = 0;
 
 struct demod_input_buffer
 {
-	int16_t   lowpassed[MAXIMUM_BUF_LENGTH];	/* input and decimated quadrature I/Q sample-pairs */
+	int16_t * lowpassed; /* input and decimated quadrature I/Q sample-pairs */
 	int	  lp_len;		/* number of valid samples in lowpassed[] - NOT quadrature I/Q sample-pairs! */
 	atomic_int  is_free;	/* 0 == free; 1 == occupied with data */
 	pthread_rwlock_t	rw;
@@ -105,7 +105,8 @@ struct demod_thread_state
 
 	pthread_t thread;
 	int channel_count;
-	struct demod_input_buffer	buffers[NUM_CIRCULAR_BUFFERS];
+	struct demod_input_buffer	buffers[MAX_CIRCULAR_BUFFERS];
+	int	  num_circular_buffers;
 	int	  buffer_write_idx;
 	int	  buffer_read_idx;
 
@@ -117,7 +118,9 @@ struct demod_thread_state
 	const char *mpx_file_pattern;
 	int audio_write_type;	/* 0: nothing, 1: file, 2: pipe */
 	int mpx_write_type;
-	int split_duration;
+	int split_duration;		/* split file or pipe in seconds */
+	int mpx_limit_duration;	/* limit per split in seconds */
+	int audio_limit_duration;
 
 	int32_t freqs[MAX_NUM_CHANNELS];
 	uint32_t center_freq;
@@ -166,12 +169,15 @@ void usage(void)
 		"\t	ranges supported, -f 118M:137M:25k\n"
 		"\t[-v increase verbosity (default: 0)]\n"
 		"\t[-M modulation (default: fm)]\n"
-		"\t	fm or nbfm or nfm, wbfm or wfm, raw or iq, am, usb, lsb\n"
+		"\t	fm or nbfm or nfm, wbfm or wfm, mwfm, raw or iq, am, usb, lsb\n"
 		"\t	wbfm == -M fm -s 170k -A fast -r 32k -E deemp\n"
+		"\t	mwfm == -M fm -s 171k -r 21375\n"
 		"\t	raw mode outputs 2x16 bit IQ pairs\n"
 		"\t[-m minimum_capture_rate Hz (default: 1m, min=900k, max=3.2m)]\n"
 		"\t[-s sample_rate (default: 24k)]\n"
 		"\t[-t split duration in seconds to split files (default: off)]\n"
+		"\t[-l [x:|a:]limit duration in seconds from (split) begin (default: off)]\n"
+		"\t     x:|a:   limits the mpx or audio signal. without that prefix, both are limited\n"
 		"\t[-a audio pipe command or file pattern (default: file) with substitutions similar to strftime(), ie.\n"
 		"\t\t\"p:%s\"\n"
 		"\t\t\"a:%s\"\n"
@@ -189,6 +195,7 @@ void usage(void)
 		"\t[-g tuner_gain (default: automatic)]\n"
 		"\t[-w tuner_bandwidth in Hz (default: automatic)]\n"
 		"\t[-W length of single buffer in units of 512 samples (default: 32 was 256)]\n"
+		"\t[-n number of circular input buffers (default: 4, max: 32)]\n"
 		"\t[-c de-emphasis_time_constant in us for wbfm. 'us' or 'eu' for 75/50 us (default: us)]\n"
 		"\t[-p ppm_error (default: 0)]\n"
 		"\t[-R run_seconds] specify number of seconds to run\n"
@@ -452,7 +459,7 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 	}
 
 	write_idx = mds->buffer_write_idx;
-	mds->buffer_write_idx = (mds->buffer_write_idx + 1) % NUM_CIRCULAR_BUFFERS;
+	mds->buffer_write_idx = (mds->buffer_write_idx + 1) % mds->num_circular_buffers;
 	buffer = &mds->buffers[write_idx];
 	pthread_rwlock_wrlock(&buffer->rw);	/* lock before writing into demod_thread_state.lowpassed */
 	if (!buffer->is_free) {
@@ -490,6 +497,8 @@ static void *multi_demod_thread_fn(void *arg)
 	double diff_ms;
 	int ch, read_idx;
 	int init_open = 1;
+	int mpx_is_limited = 1;
+	int audio_is_limited = 1;
 	const unsigned mpx_rate = mds->demod_states[0].rate_out;
 	const unsigned audio_rate = mds->demod_states[0].rate_out2 ? (unsigned)mds->demod_states[0].rate_out2 : mpx_rate;
 	struct demod_input_buffer *buffer;
@@ -501,6 +510,19 @@ static void *multi_demod_thread_fn(void *arg)
 		gettimeofday(&t2, NULL);
 		diff_ms = (t2.tv_sec - t1.tv_sec) * 1000.0;
 		diff_ms += (t2.tv_usec - t1.tv_usec) / 1000.0;
+		/* check limits first. else, files are immediately closed again, cause diff_ms still > .. */
+		if (unlikely(!mpx_is_limited && mds->mpx_limit_duration > 0 && diff_ms > 1000.0 * mds->mpx_limit_duration)) {
+			mpx_is_limited = 1;
+			close_all_channel_outputs(mds, 1, 0);	/* close mpx files or pipes */
+			if (verbosity)
+				fprintf(stderr, "closing mpx stream, cause of limit\n");
+		}
+		if (unlikely(!audio_is_limited && mds->audio_limit_duration > 0 && diff_ms > 1000.0 * mds->audio_limit_duration)) {
+			audio_is_limited = 1;
+			close_all_channel_outputs(mds, 0, 1);	/* close audio files or pipes */
+			if (verbosity)
+				fprintf(stderr, "closing audio stream, cause of limit\n");
+		}
 		if (unlikely(init_open || (mds->split_duration > 0 && diff_ms > 1000.0 * mds->split_duration))) {
 			time_t current_time = time(NULL);
 			struct tm *tm = localtime(&current_time);
@@ -510,11 +532,12 @@ static void *multi_demod_thread_fn(void *arg)
 			open_all_channel_outputs(mds, mpx_rate, audio_rate, tm, milli);
 
 			init_open = 0;
+			mpx_is_limited = audio_is_limited = 0;
 			t1 = t2;
 		}
 
 		read_idx = mds->buffer_read_idx;
-		mds->buffer_read_idx = (mds->buffer_read_idx + 1) % NUM_CIRCULAR_BUFFERS;
+		mds->buffer_read_idx = (mds->buffer_read_idx + 1) % mds->num_circular_buffers;
 		buffer = &mds->buffers[read_idx];
 		pthread_rwlock_wrlock(&buffer->rw);	/* lock before reading into demod_thread_state.lowpassed */
 
@@ -685,15 +708,18 @@ void demod_thread_state_init(struct demod_thread_state *s)
 		s->fmpx[ch] = NULL;
 	}
 
+	s->num_circular_buffers = 4;
 	s->buffer_write_idx = 0;
 	s->buffer_read_idx = 0;
 	s->split_duration = -1;
+	s->mpx_limit_duration = 0;
+	s->audio_limit_duration = 0;
 	s->channel_count = -1;
 
-	for (int i = 0; i < NUM_CIRCULAR_BUFFERS; i++)
-	{
+	for (int i = 0; i < MAX_CIRCULAR_BUFFERS; i++) {
 		pthread_rwlock_init(&s->buffers[i].rw, NULL);
 		s->buffers[i].is_free = 1;
+		s->buffers[i].lowpassed = NULL;
 	}
 
 	s->mpx_pipe_pattern = DEFAULT_MPX_PIPE_PATTERN;
@@ -708,6 +734,13 @@ void demod_thread_state_init(struct demod_thread_state *s)
 
 	pthread_cond_init(&s->ready, NULL);
 	pthread_mutex_init(&s->ready_m, NULL);
+}
+
+void demod_thread_init_ring_buffers(struct demod_thread_state *s, const int buflen)
+{
+	for (int i = 0; i < s->num_circular_buffers; i++) {
+		s->buffers[i].lowpassed = (int16_t*)malloc( sizeof(int16_t) * buflen );
+	}
 }
 
 void multi_demod_init_fptrs(struct demod_thread_state *s)
@@ -733,6 +766,13 @@ void demod_thread_cleanup(struct demod_thread_state *s)
 
 	for(int i=0; i<s->channel_count; i++) {
 		demod_cleanup(&s->demod_states[i]);
+	}
+
+	for (int k=0; k < MAX_CIRCULAR_BUFFERS; ++k) {
+		if (s->buffers[k].lowpassed) {
+			free(s->buffers[k].lowpassed);
+			s->buffers[k].lowpassed = NULL;
+		}
 	}
 }
 
@@ -771,7 +811,7 @@ int main(int argc, char **argv)
 	demod_thread_state_init(&dm_thr);
 	demod = &dm_thr.demod_states[0];
 
-	while ((opt = getopt(argc, argv, "d:f:g:m:s:a:x:t:r:p:R:E:O:F:A:M:hTq:c:w:W:D:v")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:g:m:s:a:x:t:l:r:p:R:E:O:F:A:M:hTq:c:w:W:n:D:v")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
@@ -811,6 +851,16 @@ int main(int argc, char **argv)
 			break;
 		case 't':
 			dm_thr.split_duration = atoi(optarg);
+			break;
+		case 'l':
+			if (!strncmp(optarg, "x:", 2)) {
+				dm_thr.mpx_limit_duration = atoi(&optarg[2]);
+			} else if (!strncmp(optarg, "a:", 2)) {
+				dm_thr.audio_limit_duration = atoi(&optarg[2]);
+			} else {
+				dm_thr.audio_limit_duration = atoi(optarg);
+				dm_thr.mpx_limit_duration = dm_thr.audio_limit_duration;
+			}
 			break;
 		case 'p':
 			dongle.ppm_error = atoi(optarg);
@@ -916,6 +966,14 @@ int main(int argc, char **argv)
 				demod->custom_atan = 1;
 				demod->deemph = 1;
 			}
+			if (strcmp("mwfm", optarg) == 0) {
+				demod->mode_demod = &fm_demod;
+				demod->rate_in = 171000;
+				demod->rate_out = 171000;
+				demod->rate_out2 = 21375;	/* = 171000 / 8 */
+				/* atan_lut_init();
+				demod->custom_atan = 2; */
+			}
 			break;
 		case 'T':
 			enable_biastee = 1;
@@ -948,6 +1006,17 @@ int main(int argc, char **argv)
 				dongle.buf_len = MAXIMUM_BUF_LENGTH;
 			}
 			break;
+		case 'n':
+			dm_thr.num_circular_buffers = atoi(optarg);
+			if (dm_thr.num_circular_buffers < 2) {
+				fprintf(stderr, "Warning: lower limit for option -n is 2\n");
+				dm_thr.num_circular_buffers = 2;    /* minimum 2 buffers */
+			}
+			if (dm_thr.num_circular_buffers > MAX_CIRCULAR_BUFFERS) {
+				fprintf(stderr, "Warning: limit circular buffers from option -n to %d\n", MAX_CIRCULAR_BUFFERS);
+				dm_thr.num_circular_buffers = MAX_CIRCULAR_BUFFERS;
+			}
+			break;
 		case 'h':
 		case '?':
 		default:
@@ -963,6 +1032,8 @@ int main(int argc, char **argv)
 			fprintf(stderr, "using wbfm deemphasis filter with time constant %d us\n", timeConstant );
 	}
 
+	/* demod_thread_init_ring_buffers(&dm_thr, MAXIMUM_BUF_LENGTH); */
+	demod_thread_init_ring_buffers(&dm_thr, dongle.buf_len);
 	multi_demod_init_fptrs(&dm_thr);
 	init_demods();
 
