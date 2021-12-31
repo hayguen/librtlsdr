@@ -118,7 +118,10 @@ struct demod_thread_state
 	const char *mpx_file_pattern;
 	int audio_write_type;	/* 0: nothing, 1: file, 2: pipe */
 	int mpx_write_type;
-	int split_duration;		/* split file or pipe in seconds */
+
+	int mpx_split_duration;		/* split file or pipe in seconds */
+	int audio_split_duration;
+
 	int mpx_limit_duration;	/* limit per split in seconds */
 	int audio_limit_duration;
 
@@ -175,9 +178,9 @@ void usage(void)
 		"\t	raw mode outputs 2x16 bit IQ pairs\n"
 		"\t[-m minimum_capture_rate Hz (default: 1m, min=900k, max=3.2m)]\n"
 		"\t[-s sample_rate (default: 24k)]\n"
-		"\t[-t split duration in seconds to split files (default: off)]\n"
+		"\t[-t [x:|a:]split duration in seconds to split files (default: off)]\n"
+		"\t     x:|a:   split the mpx or audio signal. without that prefix, both are split\n"
 		"\t[-l [x:|a:]limit duration in seconds from (split) begin (default: off)]\n"
-		"\t     x:|a:   limits the mpx or audio signal. without that prefix, both are limited\n"
 		"\t[-a audio pipe command or file pattern (default: file) with substitutions similar to strftime(), ie.\n"
 		"\t\t\"p:%s\"\n"
 		"\t\t\"a:%s\"\n"
@@ -372,7 +375,27 @@ void close_all_channel_outputs(struct demod_thread_state *s, int close_mpx, int 
 	}
 }
 
-void open_all_channel_outputs(struct demod_thread_state *s, const unsigned mpx_rate, const unsigned audio_rate, const struct tm *tm, const int milli)
+void open_all_mpx_channel_outputs(struct demod_thread_state *s, const unsigned mpx_rate, const struct tm *tm, const int milli)
+{
+	static char fnTmp[1024];
+	static char fnTim[1024];
+
+	for(int ch = 0; ch < s->channel_count; ++ch) {
+		uint32_t freq = s->center_freq + s->freqs[ch];
+
+		if (s->mpx_write_type == 2) {
+			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->mpx_pipe_pattern, ch, freq, mpx_rate, milli, 0);
+			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
+			s->fmpx[ch] = open_pipe(fnTim, "mpx");
+		} else if (s->mpx_write_type == 1) {
+			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->mpx_file_pattern, ch, freq, mpx_rate, milli, 0);
+			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
+			s->fmpx[ch] = create_iq_file(fnTim, "mpx");
+		}
+	}
+}
+
+void open_all_audio_channel_outputs(struct demod_thread_state *s, const unsigned audio_rate, const struct tm *tm, const int milli)
 {
 	static char fnTmp[1024];
 	static char fnTim[1024];
@@ -389,18 +412,9 @@ void open_all_channel_outputs(struct demod_thread_state *s, const unsigned mpx_r
 			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
 			s->faudio[ch] = create_iq_file(fnTim, "audio");
 		}
-
-		if (s->mpx_write_type == 2) {
-			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->mpx_pipe_pattern, ch, freq, mpx_rate, milli, 0);
-			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
-			s->fmpx[ch] = open_pipe(fnTim, "mpx");
-		} else if (s->mpx_write_type == 1) {
-			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->mpx_file_pattern, ch, freq, mpx_rate, milli, 0);
-			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
-			s->fmpx[ch] = create_iq_file(fnTim, "mpx");
-		}
 	}
 }
+
 
 void full_demod(struct demod_state *d, FILE *f_mpx, FILE *f_audio)
 {
@@ -492,9 +506,9 @@ static void *multi_demod_thread_fn(void *arg)
 {
 	struct demod_thread_state *mds = arg;
 
-	struct timeval t1, t2;
+	struct timeval t1_mpx, t1_audio, t2;
 	struct timeval timestamp;
-	double diff_ms;
+	double diff_ms_mpx, diff_ms_audio;
 	int ch, read_idx;
 	int init_open = 1;
 	int mpx_is_limited = 1;
@@ -503,38 +517,50 @@ static void *multi_demod_thread_fn(void *arg)
 	const unsigned audio_rate = mds->demod_states[0].rate_out2 ? (unsigned)mds->demod_states[0].rate_out2 : mpx_rate;
 	struct demod_input_buffer *buffer;
 
-	gettimeofday(&t1, NULL);
+	gettimeofday(&t1_mpx, NULL);
+	t1_audio = t1_mpx;
 	while (!do_exit) {
 		safe_cond_wait(&mds->ready, &mds->ready_m);
 
 		gettimeofday(&t2, NULL);
-		diff_ms = (t2.tv_sec - t1.tv_sec) * 1000.0;
-		diff_ms += (t2.tv_usec - t1.tv_usec) / 1000.0;
+		diff_ms_mpx    = (t2.tv_sec  - t1_mpx.tv_sec) * 1000.0;
+		diff_ms_mpx   += (t2.tv_usec - t1_mpx.tv_usec) / 1000.0;
+		diff_ms_audio  = (t2.tv_sec  - t1_audio.tv_sec) * 1000.0;
+		diff_ms_audio += (t2.tv_usec - t1_audio.tv_usec) / 1000.0;
+
 		/* check limits first. else, files are immediately closed again, cause diff_ms still > .. */
-		if (unlikely(!mpx_is_limited && mds->mpx_limit_duration > 0 && diff_ms > 1000.0 * mds->mpx_limit_duration)) {
+		if (unlikely(!mpx_is_limited && mds->mpx_limit_duration > 0 && diff_ms_mpx > 1000.0 * mds->mpx_limit_duration)) {
 			mpx_is_limited = 1;
 			close_all_channel_outputs(mds, 1, 0);	/* close mpx files or pipes */
 			if (verbosity)
 				fprintf(stderr, "closing mpx stream, cause of limit\n");
 		}
-		if (unlikely(!audio_is_limited && mds->audio_limit_duration > 0 && diff_ms > 1000.0 * mds->audio_limit_duration)) {
+		if (unlikely(!audio_is_limited && mds->audio_limit_duration > 0 && diff_ms_audio > 1000.0 * mds->audio_limit_duration)) {
 			audio_is_limited = 1;
 			close_all_channel_outputs(mds, 0, 1);	/* close audio files or pipes */
 			if (verbosity)
 				fprintf(stderr, "closing audio stream, cause of limit\n");
 		}
-		if (unlikely(init_open || (mds->split_duration > 0 && diff_ms > 1000.0 * mds->split_duration))) {
+
+		if (unlikely(init_open || (mds->mpx_split_duration > 0 && diff_ms_mpx > 1000.0 * mds->mpx_split_duration))) {
 			time_t current_time = time(NULL);
 			struct tm *tm = localtime(&current_time);
 			const int milli = (int)(t2.tv_usec/1000);
-
-			close_all_channel_outputs(mds, 1, 1);
-			open_all_channel_outputs(mds, mpx_rate, audio_rate, tm, milli);
-
-			init_open = 0;
-			mpx_is_limited = audio_is_limited = 0;
-			t1 = t2;
+			close_all_channel_outputs(mds, 1, 0);	/* close mpx files or pipes */
+			open_all_mpx_channel_outputs(mds, mpx_rate, tm, milli);
+			mpx_is_limited = 0;
+			t1_mpx = t2;
 		}
+		if (unlikely(init_open || (mds->audio_split_duration > 0 && diff_ms_audio > 1000.0 * mds->audio_split_duration))) {
+			time_t current_time = time(NULL);
+			struct tm *tm = localtime(&current_time);
+			const int milli = (int)(t2.tv_usec/1000);
+			close_all_channel_outputs(mds, 0, 1);	/* close audio files or pipes */
+			open_all_audio_channel_outputs(mds, audio_rate, tm, milli);
+			audio_is_limited = 0;
+			t1_audio = t2;
+		}
+		init_open = 0;
 
 		read_idx = mds->buffer_read_idx;
 		mds->buffer_read_idx = (mds->buffer_read_idx + 1) % mds->num_circular_buffers;
@@ -711,7 +737,8 @@ void demod_thread_state_init(struct demod_thread_state *s)
 	s->num_circular_buffers = 4;
 	s->buffer_write_idx = 0;
 	s->buffer_read_idx = 0;
-	s->split_duration = -1;
+	s->mpx_split_duration = -1;
+	s->audio_split_duration = -1;
 	s->mpx_limit_duration = 0;
 	s->audio_limit_duration = 0;
 	s->channel_count = -1;
@@ -850,7 +877,14 @@ int main(int argc, char **argv)
 			demod->rate_out2 = (int)atofs(optarg);
 			break;
 		case 't':
-			dm_thr.split_duration = atoi(optarg);
+			if (!strncmp(optarg, "x:", 2)) {
+				dm_thr.mpx_split_duration = atoi(&optarg[2]);
+			} else if (!strncmp(optarg, "a:", 2)) {
+				dm_thr.audio_split_duration = atoi(&optarg[2]);
+			} else {
+				dm_thr.audio_split_duration = atoi(optarg);
+				dm_thr.mpx_split_duration = dm_thr.audio_split_duration;
+			}
 			break;
 		case 'l':
 			if (!strncmp(optarg, "x:", 2)) {
