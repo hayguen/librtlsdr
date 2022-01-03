@@ -3118,6 +3118,8 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
 		return -1;
 	}
 
+	libusb_set_option(NULL, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_ERROR);
+
 	pthread_mutexattr_init(&dev->cs_mutex_attr);
 	pthread_mutexattr_settype(&dev->cs_mutex_attr, PTHREAD_MUTEX_RECURSIVE);
 	pthread_mutex_init(&dev->cs_mutex, &dev->cs_mutex_attr);
