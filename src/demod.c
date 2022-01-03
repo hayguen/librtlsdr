@@ -1003,12 +1003,14 @@ void demod_init(struct demod_state *s, int init_fields, int init_mem)
 	}
 }
 
-void demod_copy_fields(struct demod_state *dest, struct demod_state *src)
+void demod_copy_fields(struct demod_state *dest, const struct demod_state *src)
 {
 	/* save memory pointers */
 	int16_t * lowpassed = dest->lowpassed;
 	int16_t * result = dest->result;
 
+	if (dest == src)
+		return;
 	*dest = *src;
 
 	/* restore the pointers */
