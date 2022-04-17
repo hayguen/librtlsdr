@@ -66,12 +66,12 @@ struct demod_state
 	int	  comp_fir_size;	/* 9 activates droop compensation of fifth_order() with cic_9_tables[] */
 
 	int	  rate_in;		/* samplerate from rtlsdr dongle */
-	int	  rate_out;		/* samplerate for demodulation */
+	int	  rate_out;		/* samplerate for demodulation (=CBB and MPX) */
 	int	  rate_out2;		/* samplerate for additional decimation after demodulation */
 
 	int	  downsample;		/* decimation ratio: min 1, max 256 */
 	int	  downsample_passes;	/* number of decimation steps for downsample */
-	int	  post_downsample;	/* requested oversampling ratio for demodulated signal */
+	int	  post_downsample;	/* requested oversampling ratio for demodulated signal - to limit Δθ to ±π/2 */
 
 	int	  lp_sum_r, lp_sum_j;	/* state for low_pass() */
 	int	  lp_index;		/* state for low_pass() - index/number of summed input values */
