@@ -937,7 +937,7 @@ int rtlsdr_write_reg(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint16_t v
 uint16_t rtlsdr_demod_read_reg(rtlsdr_dev_t *dev, uint8_t page, uint16_t addr, uint8_t len)
 {
 	int r;
-	unsigned char data[2];
+	unsigned char data[2] = { 0 };
 
 	uint16_t index = page;
 	uint16_t reg;
@@ -2214,6 +2214,247 @@ int rtlsdr_set_agc_mode(rtlsdr_dev_t *dev, int on)
 
 	return rtlsdr_demod_write_reg(dev, 0, 0x19, on ? 0x25 : 0x05, 1);
 }
+
+
+int rtlsdr_set_impulse_nc(rtlsdr_dev_t* dev, int on, int reset_counter)
+{
+	int ron = 0, rreset = 0;
+#if LOG_API_CALLS
+	fprintf(stderr, "LOG: rtlsdr_set_impulse_nc(on %d, reset_counter %d)\n", on, reset_counter);
+#endif
+
+	if (!dev)
+		return -1;
+
+	if (on == 0 || on == 1)
+		ron = rtlsdr_demod_write_reg(dev, 1, 0x5D, on, 1);
+
+	if (reset_counter)
+		rreset = rtlsdr_demod_write_reg(dev, 1, 0x5E, (uint16_t)1U << 6, 1);
+
+	return (ron ? ron : rreset);
+}
+
+int rtlsdr_get_impulse_nc(rtlsdr_dev_t* dev, int *on, int *counter)
+{
+	uint16_t reg_on, reg_cnt_lo, reg_cnt_hi;
+#if LOG_API_CALLS
+	fprintf(stderr, "LOG: rtlsdr_get_impulse_nc()\n");
+#endif
+
+	if (!dev || !on || !counter)
+		return -1;
+
+	reg_on = rtlsdr_demod_read_reg(dev, 1, 0x5D, 1) & 1;
+	reg_cnt_hi = rtlsdr_demod_read_reg(dev, 3, 0x28, 1) & 0xFF;
+	reg_cnt_lo = rtlsdr_demod_read_reg(dev, 3, 0x29, 1) & 0xFF;
+	*on = reg_on;
+	*counter = ((unsigned)reg_cnt_hi << 8) | (unsigned)reg_cnt_lo;
+
+	return 0;
+}
+
+int rtlsdr_set_aagc(rtlsdr_dev_t* dev,
+	int en_rf, int inv_rf, int rf_gain_min, int rf_gain_max,
+	int en_if, int inv_if, int if_gain_min, int if_gain_max,
+	int loop_gain_lock, int loop_gain_unlock, int loop_gain_interference)
+{
+	int r = 0, rr = 0;
+	uint16_t min_val, max_val;
+#if LOG_API_CALLS
+	fprintf(stderr, "LOG: rtlsdr_set_agc_limits(rf_gain_min %u, rf_gain_max %u, if_gain_min %u, if_gain_max %u)\n",
+		rf_gain_min, rf_gain_max, if_gain_min, if_gain_max);
+#endif
+
+	if (!dev)
+		return -1;
+
+	if (0 <= rf_gain_min && rf_gain_min < 256) {
+		min_val = (uint16_t)rf_gain_min - (uint16_t)128U;
+		rr = rtlsdr_demod_write_reg(dev, 1, 0x0A, min_val, 1);
+		r = r ? r : rr;
+	}
+
+	if (0 <= rf_gain_max && rf_gain_max < 256) {
+		max_val = (uint16_t)rf_gain_max - (uint16_t)128U;
+		rr = rtlsdr_demod_write_reg(dev, 1, 0x0B, max_val, 1);
+		r = r ? r : rr;
+	}
+
+	if (0 <= if_gain_min  && if_gain_min < 256) {
+		min_val = (uint16_t)if_gain_min - (uint16_t)128U;
+		rr = rtlsdr_demod_write_reg(dev, 1, 0x08, min_val, 1);
+		r = r ? r : rr;
+	}
+	if (0 <= if_gain_max && if_gain_max < 256) {
+		max_val = (uint16_t)if_gain_max - (uint16_t)128U;
+		rr = rtlsdr_demod_write_reg(dev, 1, 0x09, max_val, 1);
+		r = r ? r : rr;
+	}
+
+	min_val = max_val = rtlsdr_demod_read_reg(dev, 0, 0x0E, 1) & 0xFFU;
+	if (0 <= inv_rf && inv_rf < 2)
+		min_val = (min_val & ~0x02) | (inv_rf ? 0x02 : 0x00);
+	if (0 <= inv_if && inv_if < 2)
+		min_val = (min_val & ~0x01) | (inv_if ? 0x01 : 0x00);
+	if (min_val != max_val) {
+		rr = rtlsdr_demod_write_reg(dev, 0, 0x0E, min_val, 1);
+		r = r ? r : rr;
+	}
+
+	min_val = max_val = rtlsdr_demod_read_reg(dev, 0, 0x04, 1) & 0xFFU;
+	if (0 <= en_rf && en_rf < 2)
+		min_val = (min_val & ~0x40) | (en_rf ? 0x40 : 0x00);
+	if (0 <= en_if && en_if < 2)
+		min_val = (min_val & ~0x80) | (en_if ? 0x80 : 0x00);
+	if (min_val != max_val) {
+		rr = rtlsdr_demod_write_reg(dev, 0, 0x04, min_val, 1);
+		r = r ? r : rr;
+	}
+
+	if (0 <= loop_gain_lock && loop_gain_lock < 32)
+	{
+		min_val = rtlsdr_demod_read_reg(dev, 1, 0x04, 1) & 0xFFU;
+		max_val = rtlsdr_demod_read_reg(dev, 1, 0x05, 1) & 0xFFU;
+		min_val = (min_val & ~(0x0FU << 1)) | ((loop_gain_lock & 0x0FU) << 1);
+		max_val = (max_val & ~0x80U) | ((loop_gain_lock & 0x10U) << 3);
+		rr = rtlsdr_demod_write_reg(dev, 1, 0x04, min_val, 1);
+		r = r ? r : rr;
+		rr = rtlsdr_demod_write_reg(dev, 1, 0x05, max_val, 1);
+		r = r ? r : rr;
+	}
+
+	if (0 <= loop_gain_unlock && loop_gain_unlock < 32)
+	{
+		min_val = rtlsdr_demod_read_reg(dev, 1, 0xC7, 1) & 0xFFU;
+		min_val = (min_val & ~(0x1FU << 1)) | ((loop_gain_unlock & 0x1FU) << 1);
+		rr = rtlsdr_demod_write_reg(dev, 1, 0xC7, min_val, 1);
+		r = r ? r : rr;
+	}
+
+	if (0 <= loop_gain_interference && loop_gain_interference < 32)
+	{
+		min_val = rtlsdr_demod_read_reg(dev, 1, 0xC8, 1) & 0xFFU;
+		min_val = (min_val & ~0x1FU) | (loop_gain_interference & 0x1FU);
+		rr = rtlsdr_demod_write_reg(dev, 1, 0xC8, min_val, 1);
+		r = r ? r : rr;
+	}
+
+	return r;
+}
+
+int rtlsdr_get_aagc(rtlsdr_dev_t* dev,
+	int* en_rf, int* inv_rf, int* rf_gain_min, int* rf_gain_max,
+	int* en_if, int* inv_if, int* if_gain_min, int* if_gain_max,
+	int* loop_gain_lock, int* loop_gain_unlock, int* loop_gain_interference
+	)
+{
+	uint16_t reg_min, reg_max;
+#if LOG_API_CALLS
+	fprintf(stderr, "LOG: rtlsdr_get_agc_limits()\n");
+#endif
+
+	if (!dev
+		|| !en_rf || !inv_rf || !rf_gain_min || !rf_gain_max
+		|| !en_if || !inv_if || !if_gain_min || !if_gain_max
+		|| !loop_gain_lock || !loop_gain_unlock || !loop_gain_interference
+		)
+		return -1;
+
+	reg_min = rtlsdr_demod_read_reg(dev, 0, 0x0E, 1) & 0xFFU;
+	*inv_rf = (reg_min & 0x02) ? 1 : 0;
+	*inv_if = (reg_min & 0x01) ? 1 : 0;
+
+	reg_min = rtlsdr_demod_read_reg(dev, 0, 0x04, 1) & 0xFFU;
+	*en_rf = (reg_min & 0x40) ? 1 : 0;
+	*en_if = (reg_min & 0x80) ? 1 : 0;
+
+	reg_min = rtlsdr_demod_read_reg(dev, 1, 0x0A, 1) & 0xFFU;
+	reg_max = rtlsdr_demod_read_reg(dev, 1, 0x0B, 1) & 0xFFU;
+	*rf_gain_min = (reg_min < 128U) ? (128U + reg_min) : ((128U + reg_min) & 0xFFU);
+	*rf_gain_max = (reg_max < 128U) ? (128U + reg_max) : ((128U + reg_max) & 0xFFU);
+
+	reg_min = rtlsdr_demod_read_reg(dev, 1, 0x08, 1) & 0xFFU;
+	reg_max = rtlsdr_demod_read_reg(dev, 1, 0x09, 1) & 0xFFU;
+	*if_gain_min = (reg_min < 128U) ? (128U + reg_min) : ((128U + reg_min) & 0xFFU);
+	*if_gain_max = (reg_max < 128U) ? (128U + reg_max) : ((128U + reg_max) & 0xFFU);
+
+	// loop_gain2<3:0>: page 1, offset 0x04: [4:1] (dflt: 0)  Loop Gain for AAGC Lock
+	// loop_gain2<4>:   page 1, offset 0x05, [7]   (dflt: 1)   -"-
+	reg_min = rtlsdr_demod_read_reg(dev, 1, 0x04, 1) & 0xFFU;
+	reg_max = rtlsdr_demod_read_reg(dev, 1, 0x05, 1) & 0xFFU;
+	*loop_gain_lock = ((reg_min >> 1) & 0x0F) | ((reg_max >> 3) & 0x10);
+
+	// loop_gain1       page 1, offset 0xC7, [5:1] (dflt: C)  Loop Gain for AAGC Unlock
+	reg_min = rtlsdr_demod_read_reg(dev, 1, 0xC7, 1) & 0xFFU;
+	*loop_gain_unlock = (reg_min >> 1) & 0x1F;
+
+	// loop_gain3       page 1, offset 0xC8, [4:0] (dflt: 1A) Loop Gain for existing Interference
+	reg_min = rtlsdr_demod_read_reg(dev, 1, 0xC8, 1) & 0xFFU;
+	*loop_gain_interference = reg_min & 0x1F;
+
+	// aagc_hold:       page 1, offset 0x04: [5]   (dflt: 0)  Hold AAGC Value (Open AAGC Loop)
+	return 0;
+}
+
+int rtlsdr_set_aagc_gain_distrib(rtlsdr_dev_t* dev,
+	int vtop[3], int krf[4])
+{
+	uint16_t vtop_addr[3] = { 0x06, 0xC9, 0xCA };
+	uint16_t krf_addr[4] = { 0xCB, 0x07, 0xCD, 0xCE };
+	int r = 0, rr = 0, k;
+	uint16_t min_val, max_val;
+#if LOG_API_CALLS
+	fprintf(stderr, "LOG: rtlsdr_set_agc_gain_distrib(vtop[] = %d, %d, %d, krf[] = %d, %d, %d, %d)\n",
+		vtop[0], vtop[1], vtop[2],
+		krf[0], krf[1], krf[2], krf[3]);
+#endif
+
+	if (!dev)
+		return -1;
+
+	for (k = 0; k < 3; ++k)
+	{
+		if (0 <= vtop[k] && vtop[k] < 64)
+		{
+			rr = rtlsdr_demod_write_reg(dev, 1, vtop_addr[k], (uint16_t)vtop[k], 1);
+			r = r ? r : rr;
+		}
+	}
+	for (k = 0; k < 4; ++k)
+	{
+		if (0 <= krf[k] && krf[k] < 256)
+		{
+			rr = rtlsdr_demod_write_reg(dev, 1, krf_addr[k], (uint16_t)krf[k], 1);
+			r = r ? r : rr;
+		}
+	}
+
+	return r;
+}
+
+int rtlsdr_get_aagc_gain_distrib(rtlsdr_dev_t* dev,
+	int vtop[3], int krf[4])
+{
+	uint16_t vtop_addr[3] = { 0x06, 0xC9, 0xCA };
+	uint16_t krf_addr[4] = { 0xCB, 0x07, 0xCD, 0xCE };
+	int r = 0, rr = 0, k;
+	uint16_t min_val, max_val;
+#if LOG_API_CALLS
+	fprintf(stderr, "LOG: rtlsdr_get_agc_gain_distrib()\n");
+#endif
+
+	if (!dev)
+		return -1;
+
+	for (k = 0; k < 3; ++k)
+		vtop[k] = rtlsdr_demod_read_reg(dev, 1, vtop_addr[k], 1) & 0x3FU;
+	for (k = 0; k < 4; ++k)
+		krf[k] = rtlsdr_demod_read_reg(dev, 1, krf_addr[k], 1) & 0xFFU;
+
+	return r;
+}
+
 
 int rtlsdr_set_direct_sampling(rtlsdr_dev_t *dev, int on)
 {
