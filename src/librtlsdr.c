@@ -1614,7 +1614,7 @@ int rtlsdr_set_freq_correction(rtlsdr_dev_t *dev, int ppm)
 		return -1;
 
 	if (dev->corr == ppm)
-		return -2;
+		return 0;
 
 	dev->corr = ppm;
 
@@ -2527,6 +2527,26 @@ int rtlsdr_set_direct_sampling(rtlsdr_dev_t *dev, int on)
 	r |= rtlsdr_set_center_freq64(dev, dev->freq);
 
 	return r;
+}
+
+int rtlsdr_is_connected(rtlsdr_dev_t* dev, int timeout_millis)
+{
+	int r;
+	unsigned char data[2] = { 0 };
+	uint16_t addr = (0x15 << 8) | 0x20;  // read a random register; here: spec_inv of DDC
+	const uint16_t page = 1;
+	const uint8_t len = 1;
+
+#if LOG_API_CALLS
+	fprintf(stderr, "LOG: rtlsdr_is_connected(timeout %d)\n", timeout);
+#endif
+	if (!dev)
+		return -1;
+
+	if (timeout_millis <= 0)
+		timeout_millis = CTRL_TIMEOUT;
+	r = libusb_control_transfer(dev->devh, CTRL_IN, 0, addr, page, data, len, timeout_millis);
+	return (r < 0 ? -2 : 0);
 }
 
 int rtlsdr_get_direct_sampling(rtlsdr_dev_t *dev)

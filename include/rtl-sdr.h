@@ -523,6 +523,16 @@ RTLSDR_API int rtlsdr_set_aagc_gain_distrib(rtlsdr_dev_t* dev,
 RTLSDR_API int rtlsdr_get_aagc_gain_distrib(rtlsdr_dev_t* dev,
 	int vtop[3], int krf[4]);
 
+/*!
+ * Checks, if the connection to the device is functional
+ * (it might have been removed from user)
+ *
+ * \param dev the device handle given by rtlsdr_open()
+ * \param timeout in milliseconds: 0 uses default of 300 ms
+ * \return 0 on success
+ */
+
+RTLSDR_API int rtlsdr_is_connected(rtlsdr_dev_t* dev, int timeout);
 
 /*!
  * Enable or disable the direct sampling mode. When enabled, the IF mode
