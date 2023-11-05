@@ -4670,6 +4670,7 @@ const char * rtlsdr_get_opt_help(int longInfo)
 		"\t\t                        default port number: 32323\n"
 #endif
 		"\t\tstandby=<on>          1 activates standby after close, 0 deactivates to keep heated-up\n"
+		"\t\tinc=<on>              1 activates the impulse noise cancellation (=default), 0 deactivates it\n"
 		;
 	else
 		return
@@ -4685,7 +4686,7 @@ const char * rtlsdr_get_opt_help(int longInfo)
 #else
 		"\t\tds=<direct_sampling>:dm=<ds_mode_thresh>:T=<bias_tee>"
 #endif
-		":standby=<en>\n"
+		":standby=<en>:inc=<en>\n"
 #ifdef WITH_UDP_SERVER
 		"\t\tport=<udp_port default with 1>\n"
 #endif
@@ -4912,6 +4913,12 @@ int rtlsdr_set_opt_string(rtlsdr_dev_t *dev, const char *opts, int verbose)
 			if (verbose)
 				fprintf(stderr, "\nrtlsdr_set_opt_string(): parsed standby %d\n", on);
 			ret = rtlsdr_standby_after_close(dev, on);
+		}
+		else if (!strncmp(optPart, "inc=", 4)) {
+			int on = atoi(optPart +4);
+			if (verbose)
+				fprintf(stderr, "\nrtlsdr_set_opt_string(): parsed impulse noise cancellation %d\n", on);
+			ret = rtlsdr_set_impulse_nc(dev, on, 1);
 		}
 		else if (*optPart) {
 			if (verbose)
