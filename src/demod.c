@@ -257,6 +257,7 @@ void mixer_init(struct mixer_state *mixer, double rel_freq, double samplerate)
 
 void mixer_apply(struct mixer_state *mixer, int len, const int16_t *inp_, int16_t *out_)
 {
+	/* bit growth: mixer->skip ? 0 : MIXER_ADD_PREC */
 	const cplx16 * const RESTRICT mix = mixer->mix;
 	const int16_t * RESTRICT inp = inp_;
 	int16_t * RESTRICT out = out_;
@@ -389,7 +390,7 @@ void low_pass_real(struct demod_state *s)
  * thus needs to be called twice
  * produces 1 additional bit per call (stage)
  */
-void fifth_order(int16_t *data, int length, int16_t *hist)
+void fifth_order(int16_t *data, int length, int16_t *hist, int enable_bit_growth)
 /* for half of interleaved data */
 {
 	int i;
@@ -406,15 +407,29 @@ void fifth_order(int16_t *data, int length, int16_t *hist)
 	 * that would need up to additional 5 bits.
 	 * => use one additional bit per decimation step
 	 */
-	data[0] = (a + (b+e)*5 + (c+d)*10 + f) >> 4;
-	for (i=4; i<length; i+=4) {
-		a = c;
-		b = d;
-		c = e;
-		d = f;
-		e = data[i-2];
-		f = data[i];
-		data[i/2] = (a + (b+e)*5 + (c+d)*10 + f) >> 4;
+	if (enable_bit_growth) {
+		data[0] = (a + (b+e)*5 + (c+d)*10 + f) >> 4;
+		for (i=4; i<length; i+=4) {
+			a = c;
+			b = d;
+			c = e;
+			d = f;
+			e = data[i-2];
+			f = data[i];
+			data[i/2] = (a + (b+e)*5 + (c+d)*10 + f) >> 4;
+		}
+	}
+	else {
+		data[0] = (a + (b+e)*5 + (c+d)*10 + f) >> 5;
+		for (i=4; i<length; i+=4) {
+			a = c;
+			b = d;
+			c = e;
+			d = f;
+			e = data[i-2];
+			f = data[i];
+			data[i/2] = (a + (b+e)*5 + (c+d)*10 + f) >> 5;
+		}
 	}
 	/* archive */
 	hist[0] = a;
@@ -892,6 +907,35 @@ static void arbitrary_resample(const int16_t *buf1, int16_t *buf2, int len1, int
 }
 
 
+int  downsample_result_bits(const struct demod_state *d, int n_inp_bits)
+{
+	const int ds_p = d->downsample_passes;
+	int n_bits = n_inp_bits;
+	if (ds_p) {
+		/* this is executed with "rtl_fm -F 9". */
+		int grow_limit = 16 - ( d->comp_fir_size == 9 ? 3 : 0 );
+		for (int i=0; i < ds_p; i++) {
+#if 1
+			int enable_bit_growth = (n_bits < grow_limit) ? 1 : 0;
+			n_bits += enable_bit_growth;
+#else
+			n_bits += 1;
+#endif
+		}
+		/* droop compensation */
+		if (d->comp_fir_size == 9 && ds_p <= MAXIMUM_DOWNSAMPLE_PASSES) {
+			n_bits += 3;
+		}
+	}
+	else if (d->downsample > 1) {
+		/* ceil( log2(downsample) ) */
+		int growth = d->downsample;
+		n_bits += growth;
+	}
+	return n_bits;
+}
+
+
 void downsample_input(struct demod_state *d)
 {
 	const int ds_p = d->downsample_passes;
@@ -907,10 +951,14 @@ void downsample_input(struct demod_state *d)
 		 * = 11 + number of stages
 		 * => overflow with more than 5 stages!
 		 */
+		int grow_limit = 16 - ( d->comp_fir_size == 9 ? 3 : 0 );
+		int n_bits = 8;
 		for (int i=0; i < ds_p; i++) {
 #if 1
-			fifth_order(d->lowpassed,   (d->lp_len >> i), d->lp_i_hist[i]);
-			fifth_order(d->lowpassed+1, (d->lp_len >> i) - 1, d->lp_q_hist[i]);
+			int enable_bit_growth = (n_bits < grow_limit) ? 1 : 0;
+			fifth_order(d->lowpassed,   (d->lp_len >> i), d->lp_i_hist[i], enable_bit_growth);
+			fifth_order(d->lowpassed+1, (d->lp_len >> i) - 1, d->lp_q_hist[i], enable_bit_growth);
+			n_bits += enable_bit_growth;
 #else
 			fifth_order_cx(d->lowpassed, (d->lp_len >> i), d->lp_iq_hist[i]);
 #endif
@@ -923,7 +971,8 @@ void downsample_input(struct demod_state *d)
 			generic_fir(d->lowpassed+1, d->lp_len-1,
 				cic_9_tables[ds_p], d->droop_q_hist);
 		}
-	} else {
+	}
+	else if (d->downsample > 1) {
 		/* default */
 		low_pass(d);
 	}

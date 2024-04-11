@@ -146,6 +146,7 @@ int atan_lut_init(void);
  *    low_pass()
  */
 void downsample_input(struct demod_state *d);
+int  downsample_result_bits(const struct demod_state *d, int n_inp_bits);
 
 void fm_demod(struct demod_state *fm);
 void am_demod(struct demod_state *fm);

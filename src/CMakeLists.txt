@@ -124,6 +124,7 @@ add_executable(rtl_udp rtl_udp.c)
 add_executable(rtl_test rtl_test.c)
 add_executable(rtl_fm rtl_fm.c demod.c demod.h)
 add_executable(rtl_multichannel rtl_multichannel.c demod.c demod.h)
+add_executable(rtl_offline_demod rtl_offline_demod.c demod.c demod.h)
 add_executable(rtl_ir rtl_ir.c)
 add_executable(rtl_eeprom rtl_eeprom.c)
 add_executable(rtl_adsb rtl_adsb.c)
@@ -135,9 +136,9 @@ add_executable(rtl_wavestream rtl_wavestream.c  convenience/convenience.c  conve
 
 if (WITH_RPC)
     add_executable(rtl_rpcd rtl_rpcd.c rtlsdr_rpc_msg.c)
-    set(INSTALL_TARGETS rtlsdr_shared rtlsdr_static rtl_sdr rtl_tcp rtl_udp rtl_test rtl_fm rtl_multichannel rtl_ir rtl_eeprom rtl_adsb rtl_power rtl_biast rtl_raw2wav rtl_wavestat rtl_wavestream rtl_rpcd)
+    set(INSTALL_TARGETS rtlsdr_shared rtlsdr_static rtl_sdr rtl_tcp rtl_udp rtl_test rtl_fm rtl_multichannel rtl_offline_demod rtl_ir rtl_eeprom rtl_adsb rtl_power rtl_biast rtl_raw2wav rtl_wavestat rtl_wavestream rtl_rpcd)
 else()
-    set(INSTALL_TARGETS rtlsdr_shared rtlsdr_static rtl_sdr rtl_tcp rtl_udp rtl_test rtl_fm rtl_multichannel rtl_ir rtl_eeprom rtl_adsb rtl_power rtl_biast rtl_raw2wav rtl_wavestat rtl_wavestream)
+    set(INSTALL_TARGETS rtlsdr_shared rtlsdr_static rtl_sdr rtl_tcp rtl_udp rtl_test rtl_fm rtl_multichannel rtl_offline_demod rtl_ir rtl_eeprom rtl_adsb rtl_power rtl_biast rtl_raw2wav rtl_wavestat rtl_wavestream)
 endif()
 
 target_link_libraries(rtl_sdr ${RTLSDR_TOOL_LIB} convenience_static
@@ -160,6 +161,7 @@ target_link_libraries(rtl_multichannel ${RTLSDR_TOOL_LIB} convenience_static
     ${LIBUSB_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
 )
+target_link_libraries(rtl_offline_demod convenience_static)
 target_link_libraries(rtl_ir ${RTLSDR_TOOL_LIB} convenience_static
     ${LIBUSB_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
@@ -196,6 +198,7 @@ set_property(TARGET rtl_multichannel PROPERTY C_STANDARD 11)
 if(UNIX)
     target_link_libraries(rtl_fm m)
     target_link_libraries(rtl_multichannel m)
+    target_link_libraries(rtl_offline_demod m)
     target_link_libraries(rtl_ir m)
     target_link_libraries(rtl_adsb m)
     target_link_libraries(rtl_power m)
@@ -216,6 +219,7 @@ if(WIN32)
     target_link_libraries(rtl_test libgetopt_static)
     target_link_libraries(rtl_fm libgetopt_static)
     target_link_libraries(rtl_multichannel libgetopt_static)
+    target_link_libraries(rtl_offline_demod libgetopt_static)
     target_link_libraries(rtl_ir libgetopt_static)
     target_link_libraries(rtl_eeprom libgetopt_static)
     target_link_libraries(rtl_adsb libgetopt_static)
@@ -236,6 +240,7 @@ if(WIN32)
     set_property(TARGET rtl_test APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
     set_property(TARGET rtl_fm APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
     set_property(TARGET rtl_multichannel APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
+    set_property(TARGET rtl_offline_demod APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
     set_property(TARGET rtl_ir APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
     set_property(TARGET rtl_eeprom APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
     set_property(TARGET rtl_adsb APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
